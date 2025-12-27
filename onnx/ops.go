@@ -4243,16 +4243,14 @@ func onnxQLinearMatMul(a, aScale, aZeroPoint, b, bScale, bZeroPoint, yScale, yZe
 //
 ////////////////////////////////////////////////////////////////////
 
-// convertIf converts the corresponding ONNX node to a GoMLX node.
+// convertIf converts the ONNX If operator to GoMLX nodes.
 //
 // The If operator evaluates a boolean condition and executes one of two sub-graphs.
 //
-// IMPORTANT PERFORMANCE NOTE: Unlike traditional conditional execution where only one branch
-// is evaluated, this implementation evaluates BOTH the then_branch and else_branch sub-graphs
-// and uses the Where operator to select the appropriate result. This is because GoMLX doesn't
-// yet support control flow operators (though XLA's StableHLO+PJRT do support them). While this
-// ensures correctness, it means both branches will be computed regardless of the condition value,
-// which may impact performance for expensive branch operations.
+// Implementation Strategy:
+// This function attempts to use true conditional execution via closure-backed graphs and
+// graph.IfClosure when the backend supports it. If closures are not available or if conversion
+// fails, it falls back to eager evaluation using Where to select between eagerly-computed branches.
 //
 // See ONNX documentation in:
 // https://onnx.ai/onnx/operators/onnx__If.html
@@ -4277,45 +4275,21 @@ func convertIf(m *Model, convertedOutputs map[string]*Node, node *protos.NodePro
 		exceptions.Panicf("If: else_branch must be a GRAPH attribute, got %s", elseBranchAttr.Type)
 	}
 
-	thenGraph := thenBranchAttr.G
-	elseGraph := elseBranchAttr.G
+	thenGraphProto := thenBranchAttr.G
+	elseGraphProto := elseBranchAttr.G
 
-	if thenGraph == nil || elseGraph == nil {
+	if thenGraphProto == nil || elseGraphProto == nil {
 		exceptions.Panicf("If: then_branch or else_branch graph is nil")
 	}
 
-	// Execute both branches
-	// Note: In a true conditional, only one branch would execute. Here we execute both
-	// and use Where to select. This is necessary because GoMLX doesn't yet support control flow.
 	g := cond.Graph()
 
-	// Convert then_branch sub-graph
-	// Note: convertSubGraph will update convertedOutputs with any main model nodes it converts
-	thenResults := m.convertSubGraph(g, thenGraph, convertedOutputs)
+	// Try to use closure-backed true conditional execution
+	results, err := m.tryConvertIfWithClosures(g, cond, thenGraphProto, elseGraphProto, convertedOutputs)
 
-	// Convert else_branch sub-graph (will see nodes converted by then_branch via convertedOutputs)
-	elseResults := m.convertSubGraph(g, elseGraph, convertedOutputs)
-
-	// Both branches must produce the same number of outputs
-	if len(thenResults) != len(elseResults) {
-		exceptions.Panicf("If: then_branch produced %d outputs but else_branch produced %d outputs",
-			len(thenResults), len(elseResults))
-	}
-
-	// Use Where to select between then and else results based on condition
-	// For multiple outputs, we handle the first one here and store the rest
-	results := make([]*Node, len(thenResults))
-	for i := range thenResults {
-		thenOut := thenResults[i]
-		elseOut := elseResults[i]
-
-		// Apply ONNX broadcasting rules to ensure compatible shapes
-		broadcasted := onnxBroadcastToCommonShape([]*Node{cond, thenOut, elseOut})
-		condBroadcast := broadcasted[0]
-		thenOut = broadcasted[1]
-		elseOut = broadcasted[2]
-
-		results[i] = Where(condBroadcast, thenOut, elseOut)
+	// If closure conversion failed, fall back to eager evaluation
+	if err != nil || results == nil {
+		results = m.convertIfEager(g, cond, thenGraphProto, elseGraphProto, convertedOutputs)
 	}
 
 	// Store additional outputs in convertedOutputs
@@ -4330,6 +4304,274 @@ func convertIf(m *Model, convertedOutputs map[string]*Node, node *protos.NodePro
 		return results[0]
 	}
 	return nil
+}
+
+// tryConvertIfWithClosures attempts to convert an ONNX If operation using closure-backed graphs
+// for true conditional execution. Returns an error if closures are not supported or conversion fails.
+func (m *Model) tryConvertIfWithClosures(
+	g *Graph,
+	cond *Node,
+	thenGraphProto, elseGraphProto *protos.GraphProto,
+	parentConvertedOutputs map[string]*Node,
+) ([]*Node, error) {
+	// Attempt to create closure graphs
+	thenG := g.NewClosureGraph("then_branch")
+	elseG := g.NewClosureGraph("else_branch")
+
+	// If backend doesn't support closures, return error to trigger fallback
+	if thenG == nil || elseG == nil {
+		return nil, errors.New("backend does not support closure graphs")
+	}
+
+	// Use a defer/recover to catch any panics during closure conversion
+	// and convert them to errors for graceful fallback
+	var results []*Node
+	var conversionErr error
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Conversion failed, convert panic to error
+				if err, ok := r.(error); ok {
+					conversionErr = err
+				} else {
+					conversionErr = errors.Errorf("closure conversion failed: %v", r)
+				}
+			}
+		}()
+
+		// Convert both branches to closure graphs
+		thenResults := m.convertSubGraphToClosure(thenG, thenGraphProto, parentConvertedOutputs)
+		elseResults := m.convertSubGraphToClosure(elseG, elseGraphProto, parentConvertedOutputs)
+
+		// Both branches must produce the same number of outputs
+		if len(thenResults) != len(elseResults) {
+			exceptions.Panicf("If: then_branch produced %d outputs but else_branch produced %d outputs",
+				len(thenResults), len(elseResults))
+		}
+
+		// Compile the closures
+		thenG.CompileClosure(thenResults...)
+		elseG.CompileClosure(elseResults...)
+
+		// Use IfClosure for true conditional execution
+		results = IfClosure(cond, thenG, elseG)
+	}()
+
+	if conversionErr != nil {
+		return nil, conversionErr
+	}
+
+	return results, nil
+}
+
+// convertIfEager implements the fallback eager evaluation strategy for If operations.
+// Both branches are executed and Where is used to select the result based on the condition.
+func (m *Model) convertIfEager(
+	g *Graph,
+	cond *Node,
+	thenGraphProto, elseGraphProto *protos.GraphProto,
+	parentConvertedOutputs map[string]*Node,
+) []*Node {
+	// Convert then_branch sub-graph
+	// Note: convertSubGraph will update parentConvertedOutputs with any main model nodes it converts
+	thenResults := m.convertSubGraph(g, thenGraphProto, parentConvertedOutputs)
+
+	// Convert else_branch sub-graph (will see nodes converted by then_branch via parentConvertedOutputs)
+	elseResults := m.convertSubGraph(g, elseGraphProto, parentConvertedOutputs)
+
+	// Both branches must produce the same number of outputs
+	if len(thenResults) != len(elseResults) {
+		exceptions.Panicf("If: then_branch produced %d outputs but else_branch produced %d outputs",
+			len(thenResults), len(elseResults))
+	}
+
+	// Use Where to select between then and else results based on condition
+	// For multiple outputs, we handle each one
+	results := make([]*Node, len(thenResults))
+	for i := range thenResults {
+		thenOut := thenResults[i]
+		elseOut := elseResults[i]
+
+		// Apply ONNX broadcasting rules to ensure compatible shapes
+		broadcasted := onnxBroadcastToCommonShape([]*Node{cond, thenOut, elseOut})
+		condBroadcast := broadcasted[0]
+		thenOut = broadcasted[1]
+		elseOut = broadcasted[2]
+
+		results[i] = Where(condBroadcast, thenOut, elseOut)
+	}
+
+	return results
+}
+
+// convertSubGraphToClosure converts an ONNX subgraph into a closure graph.
+// Parent values referenced by the subgraph are imported using UseParentValue.
+// Returns the output nodes from the closure graph.
+func (m *Model) convertSubGraphToClosure(
+	closureGraph *Graph,
+	subGraphProto *protos.GraphProto,
+	parentConvertedOutputs map[string]*Node,
+) []*Node {
+	// Create a mapping for values within the closure
+	// This starts with parent values that can be referenced
+	closureConvertedOutputs := make(map[string]*Node)
+
+	// Track which parent values we've already imported into the closure
+	importedParentValues := make(map[string]*Node)
+
+	// Helper function to get or create a reference to a parent value in the closure
+	importParentValue := func(valueName string, parentNode *Node) *Node {
+		// Check if we've already imported this parent value
+		if imported, exists := importedParentValues[valueName]; exists {
+			return imported
+		}
+
+		// Import the parent value into the closure using UseParentValue
+		imported := closureGraph.UseParentValue(parentNode)
+		importedParentValues[valueName] = imported
+		closureConvertedOutputs[valueName] = imported
+		return imported
+	}
+
+	// Convert subgraph initializers (constants) to GoMLX nodes in the closure
+	subGraphInitializers := make(map[string]*protos.TensorProto)
+	for _, initializerProto := range subGraphProto.Initializer {
+		initializerName := initializerProto.Name
+		if initializerName == "" {
+			continue
+		}
+		// Convert the initializer tensor to a GoMLX constant in the closure graph
+		tensor, err := tensorToGoMLX(closureGraph.Backend(), initializerProto)
+		if err != nil {
+			exceptions.Panicf("failed to convert sub-graph initializer %q: %v", initializerName, err)
+		}
+		closureConvertedOutputs[initializerName] = Const(closureGraph, tensor)
+		subGraphInitializers[initializerName] = initializerProto
+		m.variableNameToValue[initializerName] = initializerProto
+	}
+
+	// Build a mapping from output name to the node that produces it (for this sub-graph only)
+	subGraphNodeOutputToNode := make(map[string]*protos.NodeProto)
+	for _, node := range subGraphProto.Node {
+		for _, outputName := range node.Output {
+			if outputName != "" {
+				subGraphNodeOutputToNode[outputName] = node
+			}
+		}
+	}
+
+	// Temporarily add sub-graph nodes to the model's nodeOutputToNode map
+	for outputName, node := range subGraphNodeOutputToNode {
+		m.nodeOutputToNode[outputName] = node
+	}
+
+	// Cleanup temporary entries from model's maps when done
+	defer func() {
+		for initName := range subGraphInitializers {
+			delete(m.variableNameToValue, initName)
+		}
+		for outputName := range subGraphNodeOutputToNode {
+			delete(m.nodeOutputToNode, outputName)
+		}
+	}()
+
+	// Recursive helper to convert a node output within the sub-graph
+	var convertSubGraphOutput func(outputName string)
+	convertSubGraphOutput = func(outputName string) {
+		// Empty output name means optional output
+		if outputName == "" {
+			return
+		}
+
+		// Already converted in the closure?
+		if _, found := closureConvertedOutputs[outputName]; found {
+			return
+		}
+
+		// Check if it's a model-level initializer (variable)
+		if initializerProto, found := m.variableNameToValue[outputName]; found {
+			// Convert the model-level initializer to a constant in the closure
+			tensor, err := tensorToGoMLX(closureGraph.Backend(), initializerProto)
+			if err != nil {
+				exceptions.Panicf("failed to convert model initializer %q in sub-graph: %v", outputName, err)
+			}
+			closureConvertedOutputs[outputName] = Const(closureGraph, tensor)
+			return
+		}
+
+		// Check if it's a parent value that needs to be imported
+		if parentNode, foundInParent := parentConvertedOutputs[outputName]; foundInParent {
+			importParentValue(outputName, parentNode)
+			return
+		}
+
+		// Is it a sub-graph node output?
+		node, found := subGraphNodeOutputToNode[outputName]
+		if !found {
+			// Try to find and convert it from the main model
+			if mainNode, foundInMain := m.nodeOutputToNode[outputName]; foundInMain {
+				// This is a main model node that hasn't been converted yet
+				// Recursively convert its inputs first
+				for _, inputName := range mainNode.Input {
+					if inputName == "" {
+						continue
+					}
+					convertSubGraphOutput(inputName)
+				}
+				// Now convert this main model node to the closure graph
+				m.convertNode(nil, closureGraph, mainNode, closureConvertedOutputs)
+
+				// Also add to parent outputs so other branches can reuse it
+				// Note: We need to convert it to the parent graph as well
+				// But since we're in a closure, we can't do this directly
+				// This path should be rare - typically parent values are already converted
+				return
+			}
+
+			// Not found anywhere - this is an error
+			exceptions.Panicf("sub-graph output %q not found in sub-graph nodes, parent outputs, model initializers, or main model nodes", outputName)
+		}
+
+		// Recursively convert all inputs first
+		for _, inputName := range node.Input {
+			if inputName == "" {
+				continue
+			}
+			convertSubGraphOutput(inputName)
+		}
+
+		// Verify all required inputs are available before converting the node
+		for i, inputName := range node.Input {
+			if inputName == "" {
+				continue
+			}
+			if _, found := closureConvertedOutputs[inputName]; !found {
+				exceptions.Panicf("input[%d] %q for sub-graph node %q (%s) not found after conversion attempt",
+					i, inputName, node.Name, node.OpType)
+			}
+		}
+
+		// Now convert this node into the closure graph
+		m.convertNode(nil, closureGraph, node, closureConvertedOutputs)
+	}
+
+	// Convert all output nodes recursively (which will convert their dependencies)
+	for _, output := range subGraphProto.Output {
+		convertSubGraphOutput(output.Name)
+	}
+
+	// Collect the sub-graph outputs
+	outputs := make([]*Node, len(subGraphProto.Output))
+	for i, output := range subGraphProto.Output {
+		outputNode, found := closureConvertedOutputs[output.Name]
+		if !found {
+			exceptions.Panicf("sub-graph output %q not found after conversion", output.Name)
+		}
+		outputs[i] = outputNode
+	}
+
+	return outputs
 }
 
 // convertTopKDynamic implements TopK when K is dynamic (not materializable at compile time).
