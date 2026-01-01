@@ -258,7 +258,7 @@ func explicitBroadcastForBinaryOp(lhs, rhs *Node) (*Node, *Node) {
 				// Dimension 1 can be broadcast to any size
 				commonShape[axis] = lhsDim
 			} else {
-				exceptions.Panicf("explicitBroadcastForBinaryOp: incompatible dimensions at axis %d: %d vs %d", axis, lhsDim, rhsDim)
+				exceptions.Panicf("explicitBroadcastForBinaryOp: incompatible dimensions at axis %d: %d vs %d (lhs shape: %v, rhs shape: %v)", axis, lhsDim, rhsDim, lhs.Shape(), rhs.Shape())
 			}
 		}
 	}
@@ -2808,56 +2808,11 @@ func convertScatterND(_ *Model, _ map[string]*Node, node *protos.NodeProto, inpu
 		exceptions.Panicf("ScatterND: output must have rank >= 1, got rank %d", output.Rank())
 	}
 
-	// If the input had symbolic dimensions, try to infer concrete shape from indices/updates
-	// This prevents XLA from using large fallback dimensions (like 2048)
+	// After PropagateShapes(), all dimensions should be concrete.
+	// If symbolic dimensions remain, shape propagation failed.
 	if originalShape.HasSymbolicDim() {
-		g := data.Graph()
-		k := indices.Shape().Dim(indices.Rank() - 1) // last dim of indices
-
-		// Infer output shape from indices and updates
-		// indices: [i_0, i_1, ..., i_{q-1}, k] e.g., [128, 2]
-		// updates: [i_0, ..., i_{q-1}, d_k, d_{k+1}, ..., d_{r-1}] e.g., [128, 512]
-		// output:  [d_0, d_1, ..., d_{r-1}] e.g., [?, ?, 512]
-		//
-		// For GLiNER model pattern: indices[128,2] updates[128,512] -> output[?,?,512]
-		// The output is later Gathered and Transposed to get [seq_len, batch, features]
-		// So output should be [1, 128, 512] to get [1, 128, 512] after Gather -> [128, 1, 512] after Transpose
-		outputDims := make([]int, originalShape.Rank())
-		seqLen := indices.Shape().Dim(0) // e.g., 128
-
-		for i := 0; i < originalShape.Rank(); i++ {
-			if i < k && originalShape.Dim(i) < 0 {
-				// First k dimensions are indexed by the k coordinates in each indices entry
-				// For typical attention patterns:
-				// - dim 0: small (1 or num_directions) - this gets gathered later
-				// - dim 1: sequence length
-				if i == 0 {
-					outputDims[i] = 1 // Small first dimension for gather
-				} else if i == 1 && seqLen > 0 {
-					outputDims[i] = seqLen // Sequence length
-				} else {
-					outputDims[i] = 1
-				}
-			} else if i >= k && originalShape.Dim(i) < 0 {
-				// Dimensions >= k come from updates shape
-				updateIdx := indices.Rank() - 1 + (i - k) // i_{q-1} + (i - k)
-				if updateIdx < updates.Rank() && updates.Shape().Dim(updateIdx) > 0 {
-					outputDims[i] = updates.Shape().Dim(updateIdx)
-				} else {
-					outputDims[i] = 1 // fallback
-				}
-			} else {
-				outputDims[i] = originalShape.Dim(i)
-			}
-		}
-
-		// Build shape tensor with inferred dimensions
-		shapeParts := make([]*Node, len(outputDims))
-		for i, dim := range outputDims {
-			shapeParts[i] = Const(g, int32(dim))
-		}
-		shapeNode := Stack(shapeParts, 0)
-		output = DynamicReshape(output, shapeNode)
+		exceptions.Panicf("ScatterND: input has symbolic dimensions which XLA cannot handle. "+
+			"Ensure all input dimensions are concrete. Shape: %s", originalShape)
 	}
 
 	return output
@@ -2953,22 +2908,11 @@ func onnxScatterElements(data *Node, indices *Node, updates *Node, scatterAxis i
 		exceptions.Panicf("ScatterElements: unrecognized reduction mode %q", reduction)
 	}
 
-	// If the input had symbolic dimensions, restore them with DynamicReshape
-	// This prevents XLA from materializing symbolic dims to 1
+	// After PropagateShapes(), all dimensions should be concrete.
+	// If symbolic dimensions remain, shape propagation failed.
 	if originalShape.HasSymbolicDim() {
-		// Build shape tensor from data's runtime dimensions
-		shapeParts := make([]*Node, originalShape.Rank())
-		for i := 0; i < originalShape.Rank(); i++ {
-			if originalShape.Dim(i) < 0 {
-				// Symbolic dimension - get at runtime
-				shapeParts[i] = GetDimensionSize(data, i)
-			} else {
-				// Concrete dimension - use constant
-				shapeParts[i] = Const(g, int32(originalShape.Dim(i)))
-			}
-		}
-		shapeNode := Stack(shapeParts, 0)
-		output = DynamicReshape(output, shapeNode)
+		exceptions.Panicf("ScatterElements: input has symbolic dimensions which XLA cannot handle. "+
+			"Ensure all input dimensions are concrete. Shape: %s", originalShape)
 	}
 
 	return output
@@ -4216,7 +4160,16 @@ func convertNonZero(m *Model, convertedOutputs map[string]*Node, node *protos.No
 		exceptions.Panicf("NonZero requires concrete dimensions for XLA backend")
 	}
 
-	// Maximum possible non-zeros is the total number of elements
+	// Try to materialize the input to get exact non-zero count
+	// This is crucial for models like GLiNER that depend on data-driven shapes
+	if node != nil && len(node.Input) > 0 {
+		inputT, err := m.materializeConstantExpression(node.Input[0], convertedOutputs)
+		if err == nil && inputT != nil {
+			return convertNonZeroWithConstantInput(g, inputT, rank)
+		}
+	}
+
+	// Fall back to worst-case allocation if input cannot be materialized
 	maxNonZeros := input.Shape().Size()
 
 	// Handle empty input (zero elements)
@@ -4224,13 +4177,6 @@ func convertNonZero(m *Model, convertedOutputs map[string]*Node, node *protos.No
 		// Return an empty tensor of shape [rank, 0]
 		emptyShape := shapes.Make(dtypes.Int64, rank, 0)
 		return Zeros(g, emptyShape)
-	}
-
-	// Warn if the output would be very large
-	if maxNonZeros > 100000 {
-		// This is just a sanity check - for very large tensors this might be inefficient
-		// but it should still work
-		_ = maxNonZeros
 	}
 
 	// Flatten input to 1D for easier processing
@@ -4274,4 +4220,81 @@ func convertNonZero(m *Model, convertedOutputs map[string]*Node, node *protos.No
 	// works fine as the zeros will naturally be filtered out.
 
 	return result
+}
+
+// convertNonZeroWithConstantInput handles NonZero when the input is a known constant.
+// This produces the exact output shape [rank, actualNonZeros] matching ONNX runtime behavior.
+func convertNonZeroWithConstantInput(g *Graph, inputT *tensors.Tensor, rank int) *Node {
+	dims := inputT.Shape().Dimensions
+	dtype := inputT.DType()
+	flatSize := inputT.Shape().Size()
+
+	// Count non-zeros and collect their indices
+	var nonZeroIndices [][]int64
+
+	// Access flat data through the callback API
+	inputT.MustConstFlatData(func(flatData any) {
+		for flatIdx := 0; flatIdx < flatSize; flatIdx++ {
+			// Convert flat index to multi-dimensional indices
+			multiIdx := make([]int64, rank)
+			remaining := flatIdx
+			for axis := rank - 1; axis >= 0; axis-- {
+				multiIdx[axis] = int64(remaining % dims[axis])
+				remaining /= dims[axis]
+			}
+
+			// Check if value is non-zero using the flat data
+			isNonZero := false
+			switch dtype {
+			case dtypes.Bool:
+				isNonZero = flatData.([]bool)[flatIdx]
+			case dtypes.Int8:
+				isNonZero = flatData.([]int8)[flatIdx] != 0
+			case dtypes.Int16:
+				isNonZero = flatData.([]int16)[flatIdx] != 0
+			case dtypes.Int32:
+				isNonZero = flatData.([]int32)[flatIdx] != 0
+			case dtypes.Int64:
+				isNonZero = flatData.([]int64)[flatIdx] != 0
+			case dtypes.Uint8:
+				isNonZero = flatData.([]uint8)[flatIdx] != 0
+			case dtypes.Uint16:
+				isNonZero = flatData.([]uint16)[flatIdx] != 0
+			case dtypes.Uint32:
+				isNonZero = flatData.([]uint32)[flatIdx] != 0
+			case dtypes.Uint64:
+				isNonZero = flatData.([]uint64)[flatIdx] != 0
+			case dtypes.Float32:
+				isNonZero = flatData.([]float32)[flatIdx] != 0
+			case dtypes.Float64:
+				isNonZero = flatData.([]float64)[flatIdx] != 0
+			default:
+				exceptions.Panicf("NonZero: unsupported dtype %v", dtype)
+			}
+
+			if isNonZero {
+				nonZeroIndices = append(nonZeroIndices, multiIdx)
+			}
+		}
+	})
+
+	numNonZeros := len(nonZeroIndices)
+
+	// Handle empty result
+	if numNonZeros == 0 {
+		emptyShape := shapes.Make(dtypes.Int64, rank, 0)
+		return Zeros(g, emptyShape)
+	}
+
+	// Build output tensor: [rank, numNonZeros]
+	// Each row contains the indices for one dimension
+	outputData := make([]int64, rank*numNonZeros)
+	for r := 0; r < rank; r++ {
+		for i := 0; i < numNonZeros; i++ {
+			outputData[r*numNonZeros+i] = nonZeroIndices[i][r]
+		}
+	}
+
+	outputT := tensors.FromFlatDataAndDimensions(outputData, rank, numNonZeros)
+	return Const(g, outputT)
 }

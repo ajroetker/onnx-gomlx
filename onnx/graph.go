@@ -382,6 +382,7 @@ func (m *Model) convertNode(_ *context.Context, g *Graph, node *protos.NodeProto
 	// Anything different must be implemented by the specific op switch.
 	var result *Node
 	inputs := sliceMap(node.Input, func(n string) *Node { return convertedOutputs[n] })
+
 	switch node.OpType {
 	// Binary operators: see the note on differences on default broadcasting.
 	case "Add":
