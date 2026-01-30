@@ -623,7 +623,7 @@ func (m *Model) convertGemm(node *protos.NodeProto, inputs []*Node) *Node {
 		var weight *Node
 		if transposeB {
 			// weight is [out_features, in_features], transpose to [in_features, out_features]
-			weight = TransposeAllAxes(operandB)
+			weight = TransposeAllAxes(operandB, 1, 0)
 		} else {
 			// weight is already [in_features, out_features]
 			weight = operandB
@@ -2427,6 +2427,21 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 		scaleValue = scaleValue * scaleValue // Will apply sqrt later via separate scaling
 		// Actually, standard attention uses 1/sqrt(head_size)
 		scaleValue = 1.0 / math.Sqrt(float64(headSize))
+	}
+
+	// Try fused SDPA if the backend supports it and there is no mask.
+	// The fused kernel only supports a 2D [seqLen, kvLen] additive mask, which doesn't
+	// match ONNX's mask shapes (batch-dependent), so we only use the fast path when
+	// no mask is present.
+	if attentionMask == nil && query.Graph().Backend().Capabilities().Operations[backends.OpTypeFusedMultiHeadSDPA] {
+		numKVHeads := numHeads
+		output := FusedMultiHeadSDPA(query, key, value, nil, numHeads, numKVHeads, scaleValue, false)
+		if was3D {
+			output = TransposeAllDims(output, 0, 2, 1, 3)
+			vHeadSize := output.Shape().Dimensions[3]
+			output = Reshape(output, batchSize, qSeqLen, numHeads*vHeadSize)
+		}
+		return output
 	}
 
 	// Compute Q @ K^T
