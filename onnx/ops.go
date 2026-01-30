@@ -14,6 +14,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	timage "github.com/gomlx/gomlx/pkg/core/tensors/images"
 	"github.com/gomlx/gomlx/pkg/ml/layers/lstm"
+	"github.com/gomlx/gomlx/pkg/ml/nn"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 	"github.com/pkg/errors"
 )
@@ -558,7 +559,7 @@ func convertConcat(node *protos.NodeProto, inputs []*Node) *Node {
 // https://onnx.ai/onnx/operators/onnx__Softmax.html
 func convertSoftmax(node *protos.NodeProto, inputs []*Node) *Node {
 	axis := getIntAttrOr(node, "axis", -1)
-	return Softmax(inputs[0], axis)
+	return nn.Softmax(inputs[0], axis)
 }
 
 // convertCast converts a ONNX node to a GoMLX node.
@@ -613,7 +614,26 @@ func (m *Model) convertGemm(node *protos.NodeProto, inputs []*Node) *Node {
 	transposeA := getBoolAttrOr(node, "transA", false)
 	transposeB := getBoolAttrOr(node, "transB", false)
 	alpha := getFloatAttrOr(node, "alpha", 1.0)
-	beta := getFloatAttrOr(node, "alpha", 1.0)
+	beta := getFloatAttrOr(node, "beta", 1.0)
+
+	// Try fused Dense path: y = x @ weight^T + bias
+	// Dense expects weight as [in_features, out_features].
+	// Applicable when transA=false, alpha=1.0, beta=1.0, and both operands are 2D.
+	if !transposeA && alpha == 1.0 && beta == 1.0 && operandA.Rank() == 2 && operandB.Rank() == 2 {
+		var weight *Node
+		if transposeB {
+			// weight is [out_features, in_features], transpose to [in_features, out_features]
+			weight = TransposeAllAxes(operandB)
+		} else {
+			// weight is already [in_features, out_features]
+			weight = operandB
+		}
+		var bias *Node
+		if len(inputs) > 2 {
+			bias = inputs[2]
+		}
+		return nn.Dense(operandA, weight, bias)
+	}
 
 	aAxes, bAxes := "ij", "jk"
 	if transposeA {
@@ -2009,6 +2029,11 @@ func convertLayerNormalization(_ *Model, _ map[string]*Node, node *protos.NodePr
 		axes[i] = axis + i
 	}
 
+	// Use fused LayerNorm if the backend supports it.
+	if x.Graph().Backend().Capabilities().Operations[backends.OpTypeFusedLayerNorm] {
+		return nn.LayerNorm(x, axes, float64(epsilon), scale, bias)
+	}
+
 	// Reshape scale and bias to match input rank for broadcasting
 	// Scale/bias have shape matching the normalized dimensions
 	// Need to add leading 1s to match the input rank
@@ -2439,7 +2464,7 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 	}
 
 	// Softmax over last dimension (kv_seq)
-	attnWeights := Softmax(scores, -1)
+	attnWeights := nn.Softmax(scores, -1)
 
 	// Compute attention output: attn_weights @ value
 	// attn_weights: (batch, num_heads, q_seq, kv_seq)
