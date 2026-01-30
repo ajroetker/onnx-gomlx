@@ -559,7 +559,7 @@ func convertConcat(node *protos.NodeProto, inputs []*Node) *Node {
 // https://onnx.ai/onnx/operators/onnx__Softmax.html
 func convertSoftmax(node *protos.NodeProto, inputs []*Node) *Node {
 	axis := getIntAttrOr(node, "axis", -1)
-	return nn.Softmax(inputs[0], axis)
+	return Softmax(inputs[0], axis)
 }
 
 // convertCast converts a ONNX node to a GoMLX node.
@@ -2464,7 +2464,7 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 	}
 
 	// Softmax over last dimension (kv_seq)
-	attnWeights := nn.Softmax(scores, -1)
+	attnWeights := Softmax(scores, -1)
 
 	// Compute attention output: attn_weights @ value
 	// attn_weights: (batch, num_heads, q_seq, kv_seq)
