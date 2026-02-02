@@ -2342,8 +2342,13 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 		value = TransposeAllDims(value, 0, 2, 1, 3)
 	}
 
+	// After reshaping, query is always (batch, num_heads, seq, head_size).
+	// Infer numHeads from the shape if not provided as an attribute (4D input case).
+	if numHeads == 0 {
+		numHeads = query.Shape().Dimensions[1]
+	}
+
 	// Compute scale (default is 1/sqrt(head_size))
-	// After reshaping, query is always (batch, num_heads, seq, head_size)
 	headSize := query.Shape().Dimensions[query.Rank()-1]
 	var scaleValue float64
 	if scale > 0 {
@@ -2352,22 +2357,8 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 		scaleValue = 1.0 / math.Sqrt(float64(headSize))
 	}
 
-	// Try fused SDPA if the backend supports it and there is no mask.
-	// The fused kernel only supports a 2D [seqLen, kvLen] additive mask, which doesn't
-	// match ONNX's mask shapes (batch-dependent), so we only use the fast path when
-	// no mask is present.
-	if attentionMask == nil && query.Graph().Backend().Capabilities().Operations[backends.OpTypeFusedMultiHeadSDPA] {
-		numKVHeads := numHeads
-		output := FusedMultiHeadSDPA(query, key, value, nil, numHeads, numKVHeads, scaleValue, false)
-		if was3D {
-			output = TransposeAllDims(output, 0, 2, 1, 3)
-			vHeadSize := output.Shape().Dimensions[3]
-			output = Reshape(output, batchSize, qSeqLen, numHeads*vHeadSize)
-		}
-		return output
-	}
-
-	// Reshape attention mask to be broadcastable to (batch, num_heads, q_seq, kv_seq)
+	// Reshape attention mask to be broadcastable to (batch, num_heads, q_seq, kv_seq).
+	// This is needed by both the fused and decomposed paths.
 	if attentionMask != nil {
 		maskRank := attentionMask.Rank()
 		if maskRank == 2 {
@@ -2381,7 +2372,22 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 		}
 	}
 
-	// Use ScaledDotProductAttention for the core computation.
+	// Try fused SDPA if the backend supports it.
+	// The SimpleGo backend handles 2D/3D/4D masks via broadcast strides.
+	// Backends that don't support fused SDPA (e.g. XLA) return ErrNotImplemented,
+	// which InternalFusedOpCaller catches and falls back to the decomposed path.
+	if query.Graph().Backend().Capabilities().Operations[backends.OpTypeFusedMultiHeadSDPA] {
+		numKVHeads := numHeads
+		output := FusedMultiHeadSDPA(query, key, value, attentionMask, numHeads, numKVHeads, scaleValue, false)
+		if was3D {
+			output = TransposeAllDims(output, 0, 2, 1, 3)
+			vHeadSize := output.Shape().Dimensions[3]
+			output = Reshape(output, batchSize, qSeqLen, numHeads*vHeadSize)
+		}
+		return output
+	}
+
+	// Decomposed fallback for backends without fused SDPA support.
 	// query, key, value are already in [batch, heads, seq, dim] layout.
 	builder := attention.ScaledDotProductAttention(query, key, value)
 	if scale > 0 {
