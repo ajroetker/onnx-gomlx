@@ -2035,7 +2035,7 @@ func convertLayerNormalization(_ *Model, _ map[string]*Node, node *protos.NodePr
 
 	// Use fused LayerNorm if the backend supports it.
 	if x.Graph().Backend().Capabilities().Operations[backends.OpTypeFusedLayerNorm] {
-		return nn.LayerNorm(x, axes, float64(epsilon), scale, bias)
+		return nn.LayerNorm(x, axes, float64(epsilon), scale, bias, nil)
 	}
 
 	// Reshape scale and bias to match input rank for broadcasting
