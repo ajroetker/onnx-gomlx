@@ -2,6 +2,7 @@ package onnx
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 
@@ -2245,10 +2246,10 @@ func convertRotaryEmbedding(m *Model, convertedOutputs map[string]*Node, node *p
 		sin = Reshape(sin, cosDims[0], 1, cosDims[1], cosDims[2])
 	}
 
-	// Apply rotation using pre-computed cos/sin via ApplyWithCosSin.
-	// ApplyWithCosSin handles splitting, rotation, recombination, and partial rotation
+	// Apply rotation using pre-computed cos/sin via RoPEWithCosSin.
+	// It handles splitting, rotation, recombination, and partial rotation
 	// (pass-through for dimensions beyond rotary_dim) automatically based on cos/sin dimensions.
-	result := pos.ApplyWithCosSin(x, cos, sin, interleaved)
+	result := pos.NewRoPEWithCosSin(cos, sin).WithInterleaved(interleaved).Apply(x, nil)
 
 	// If input was 3D, reshape back
 	if was3D {
@@ -2367,16 +2368,14 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 		return output
 	}
 
-	// Decomposed fallback for backends without fused SDPA support.
-	// query, key, value are already in [batch, heads, seq, dim] layout.
-	builder := attention.ScaledDotProductAttention(query, key, value)
-	if scale > 0 {
-		builder = builder.WithScale(float64(scale))
+	// Decomposed fallback using AttentionCore for backends without fused SDPA support.
+	// query, key, value are already in [batch, heads, seq, dim] layout (LayoutBHSD).
+	headDim := query.Shape().Dimensions[3]
+	scaleValue := float64(scale)
+	if scale <= 0 {
+		scaleValue = 1.0 / math.Sqrt(float64(headDim))
 	}
-	if attentionMask != nil {
-		builder = builder.WithAdditiveMask(attentionMask)
-	}
-	output := builder.Done()
+	output, _ := attention.AttentionCore(query, key, value, scaleValue, attentionMask, false, attention.LayoutBHSD)
 
 	// Reshape back to 3D if input was 3D
 	if was3D {
@@ -2484,11 +2483,12 @@ func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, nod
 		mask = LogicalAnd(mask, LessThan(dist, Scalar(g, dtypes.Int32, localWindowSize)))
 	}
 
-	builder := attention.ScaledDotProductAttention(query, attKey, attValue)
-	if scale > 0 {
-		builder = builder.WithScale(float64(scale))
+	scaleValue := float64(scale)
+	if scale <= 0 {
+		scaleValue = 1.0 / math.Sqrt(float64(headSize))
 	}
-	output := builder.WithBooleanMask(mask).Done()
+	additiveMask := attention.BooleanToAdditiveMask(mask, query.DType())
+	output, _ := attention.AttentionCore(query, attKey, attValue, scaleValue, additiveMask, false, attention.LayoutBHSD)
 
 	// Reshape output: (batch, num_heads, qSeqLen, head_size) -> (batch, qSeqLen, num_heads * head_size)
 	output = TransposeAllDims(output, 0, 2, 1, 3)
