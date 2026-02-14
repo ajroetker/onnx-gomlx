@@ -2274,7 +2274,7 @@ func convertRotaryEmbedding(m *Model, convertedOutputs map[string]*Node, node *p
 	// Apply rotation using pre-computed cos/sin via RoPEWithCosSin.
 	// It handles splitting, rotation, recombination, and partial rotation
 	// (pass-through for dimensions beyond rotary_dim) automatically based on cos/sin dimensions.
-	result := pos.NewRoPEWithCosSin(cos, sin).WithInterleaved(interleaved).Apply(x, nil)
+	result := pos.NewRoPEWithCosSin(cos, sin).WithInterleaved(interleaved).Apply(x, nil, x.Rank()-2)
 
 	// If input was 3D, reshape back
 	if was3D {
@@ -2396,31 +2396,10 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 		}
 	}
 
-	// Try fused SDPA if the backend supports it.
-	// The SimpleGo backend handles 2D/3D/4D masks via broadcast strides.
-	// Backends that don't support fused SDPA (e.g. XLA) return ErrNotImplemented,
-	// which InternalFusedOpCaller catches and falls back to the decomposed path.
-	if query.Graph().Backend().Capabilities().Operations[backends.OpTypeFusedMultiHeadSDPA] {
-		numKVHeads := numHeads
-		output := FusedMultiHeadSDPA(query, key, value, attentionMask, numHeads, numKVHeads, scaleValue, false)
-		if was3D {
-			output = TransposeAllDims(output, 0, 2, 1, 3)
-			vHeadSize := output.Shape().Dimensions[3]
-			output = Reshape(output, batchSize, qSeqLen, numHeads*vHeadSize)
-		}
-		return output
-	}
-
-	// Decomposed fallback for backends without fused SDPA support.
-	// query, key, value are already in [batch, heads, seq, dim] layout.
-	builder := attention.ScaledDotProductAttention(query, key, value)
-	if scale > 0 {
-		builder = builder.WithScale(float64(scale))
-	}
-	if attentionMask != nil {
-		builder = builder.WithAdditiveMask(attentionMask)
-	}
-	output := builder.Done()
+	// Compute attention using attention.Core.
+	// query, key, value are already in [batch, heads, seq, dim] layout (LayoutBHSD).
+	// attentionMask here is a float additive mask (already reshaped above), so Core adds it to scores.
+	output, _ := attention.Core(nil, query, key, value, scaleValue, attentionMask, 0, attention.LayoutBHSD, false, false)
 
 	// Reshape back to 3D if input was 3D
 	if was3D {
@@ -2504,16 +2483,8 @@ func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, nod
 
 	totalSeqLen := presentKey.Shape().Dimensions[2]
 
-	// Expand KV heads to match query heads for GQA via reshape+broadcast.
-	attKey := presentKey
-	attValue := presentValue
-	if kvNumHeads != numHeads {
-		repeats := numHeads / kvNumHeads
-		attKey = gqaRepeatHeads(presentKey, batchSize, kvNumHeads, repeats, totalSeqLen, headSize)
-		attValue = gqaRepeatHeads(presentValue, batchSize, kvNumHeads, repeats, totalSeqLen, headSize)
-	}
-
 	// Build causal mask: query at absolute position qPos can attend to kvPos <= qPos.
+	// The mask has shape [1, 1, qSeqLen, totalSeqLen], broadcastable to [batch, numHeads, qSeq, kvSeq].
 	g := query.Graph()
 	qPositions := Iota(g, shapes.Make(dtypes.Int32, qSeqLen), 0)
 	qPositions = AddScalar(qPositions, float64(totalSeqLen-qSeqLen))
@@ -2528,11 +2499,13 @@ func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, nod
 		mask = LogicalAnd(mask, LessThan(dist, Scalar(g, dtypes.Int32, localWindowSize)))
 	}
 
-	builder := attention.ScaledDotProductAttention(query, attKey, attValue)
-	if scale > 0 {
-		builder = builder.WithScale(float64(scale))
+	scaleValue := float64(scale)
+	if scale <= 0 {
+		scaleValue = 1.0 / math.Sqrt(float64(headSize))
 	}
-	output := builder.WithBooleanMask(mask).Done()
+	// Pass the boolean mask directly — Core auto-detects boolean masks and uses MaskedSoftmax.
+	// K/V retain their original numKVHeads; Core handles GQA head mapping natively.
+	output, _ := attention.Core(nil, query, presentKey, presentValue, scaleValue, mask, 0, attention.LayoutBHSD, false, false)
 
 	// Reshape output: (batch, num_heads, qSeqLen, head_size) -> (batch, qSeqLen, num_heads * head_size)
 	output = TransposeAllDims(output, 0, 2, 1, 3)
@@ -2547,14 +2520,6 @@ func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, nod
 	}
 
 	return output
-}
-
-// gqaRepeatHeads repeats KV heads to match the query head count for grouped query attention.
-// (batch, kvHeads, seq, dim) -> (batch, kvHeads*repeats, seq, dim)
-func gqaRepeatHeads(x *Node, batchSize, kvHeads, repeats, seqLen, headSize int) *Node {
-	x = Reshape(x, batchSize, kvHeads, 1, seqLen, headSize)
-	x = BroadcastToShape(x, shapes.Make(x.DType(), batchSize, kvHeads, repeats, seqLen, headSize))
-	return Reshape(x, batchSize, kvHeads*repeats, seqLen, headSize)
 }
 
 // convertSplit converts the corresponding ONNX node to GoMLX nodes.
