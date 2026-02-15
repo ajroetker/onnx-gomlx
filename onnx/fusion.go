@@ -14,6 +14,8 @@ const (
 	FusionSDPA FusionType = iota
 	FusionQKVDense
 	FusionDenseGelu
+	FusionQuantizedDense
+	FusionQuantizedQKVDense
 )
 
 // FusionGroup describes a set of ONNX nodes that can be replaced by a single fused GoMLX op.
@@ -79,6 +81,8 @@ func (m *Model) detectFusionPatterns() {
 	m.detectSDPAPatterns(graph, consumers)
 	m.detectQKVDensePatterns(graph, consumers)
 	m.detectDenseGeluPatterns(graph, consumers)
+	m.detectQuantizedDensePatterns(graph, consumers)
+	m.detectQuantizedQKVDensePatterns()
 }
 
 // buildActiveFusionGroups returns the subset of detectedFusionGroups whose required ops
@@ -89,11 +93,15 @@ func (m *Model) buildActiveFusionGroups(caps backends.Capabilities) map[string]*
 		var supported bool
 		switch fg.Type {
 		case FusionSDPA:
-			supported = caps.Operations[backends.OpTypeFusedMultiHeadSDPA]
+			supported = caps.Operations[backends.OpTypeFusedScaledDotProductAttention]
 		case FusionQKVDense:
-			supported = caps.Operations[backends.OpTypeFusedQKVDense]
+			supported = caps.Operations[backends.OpTypeFusedAttentionQKVProjection]
 		case FusionDenseGelu:
 			supported = caps.Operations[backends.OpTypeFusedDense]
+		case FusionQuantizedDense:
+			supported = caps.Operations[backends.OpTypeFusedQuantizedDense]
+		case FusionQuantizedQKVDense:
+			supported = caps.Operations[backends.OpTypeFusedQuantizedDense]
 		}
 		if supported {
 			active[name] = fg
@@ -111,6 +119,10 @@ func (m *Model) emitFusionGroup(ctx *context.Context, g *Graph, fg *FusionGroup,
 		m.emitQKVDense(ctx, g, fg, convertedOutputs)
 	case FusionDenseGelu:
 		m.emitDenseGelu(ctx, g, fg, convertedOutputs)
+	case FusionQuantizedDense:
+		m.emitQuantizedDense(ctx, g, fg, convertedOutputs)
+	case FusionQuantizedQKVDense:
+		m.emitQuantizedQKVDense(ctx, g, fg, convertedOutputs)
 	}
 }
 

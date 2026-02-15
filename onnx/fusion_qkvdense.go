@@ -221,7 +221,7 @@ func (m *Model) emitQKVDense(ctx *context.Context, g *Graph, fg *FusionGroup, co
 		biasV = convertedOutputs[p.BiasVName]
 	}
 
-	q, k, v := FusedQKVDense(x, wQKV, biasQ, biasK, biasV, p.QDim, p.KVDim)
+	q, k, v := BackendFusedAttentionQKVProjection(x, wQKV, biasQ, biasK, biasV, p.QDim, p.KVDim)
 	convertedOutputs[p.QOutputName] = q
 	convertedOutputs[p.KOutputName] = k
 	convertedOutputs[p.VOutputName] = v

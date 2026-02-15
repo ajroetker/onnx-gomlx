@@ -3,6 +3,7 @@ package onnx
 import (
 	"math"
 
+	"github.com/gomlx/gomlx/backends"
 	. "github.com/gomlx/gomlx/pkg/core/graph" //nolint
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
@@ -629,6 +630,6 @@ func (m *Model) emitSDPA(_ *context.Context, g *Graph, fg *FusionGroup, converte
 		mask = convertedOutputs[p.MaskInputName]
 	}
 
-	result := FusedMultiHeadSDPA(q, k, v, mask, p.NumHeads, p.NumKVHeads, p.Scale, false)
+	result := BackendFusedScaledDotProductAttention(q, k, v, mask, p.NumHeads, p.NumKVHeads, backends.AxesLayoutBHSD, p.Scale, false)
 	convertedOutputs[fg.RootOutputName] = result
 }
