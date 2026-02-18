@@ -24,44 +24,96 @@ type QuantizedSDPAParams struct {
 	KIsTransposed bool
 }
 
-// detectQuantizedSDPAPatterns scans the ONNX graph for the quantized attention chain:
+// quantizedSDPACandidate implements FusionCandidate for quantized SDPA.
+type quantizedSDPACandidate struct {
+	params          *QuantizedSDPAParams
+	outputName      string
+	internalOutputs map[string]bool
+	externalInputs  []string
+}
+
+func (c *quantizedSDPACandidate) Name() string                    { return "QuantizedSDPA" }
+func (c *quantizedSDPACandidate) Score() float32                   { return 90.0 }
+func (c *quantizedSDPACandidate) OutputNames() []string            { return []string{c.outputName} }
+func (c *quantizedSDPACandidate) InternalOutputs() map[string]bool { return c.internalOutputs }
+func (c *quantizedSDPACandidate) ExternalInputs() []string         { return c.externalInputs }
+
+func (c *quantizedSDPACandidate) Emit(_ *context.Context, g *Graph, convertedOutputs map[string]*Node) {
+	p := c.params
+
+	q := convertedOutputs[p.QInputName]
+	k := convertedOutputs[p.KInputName]
+	v := convertedOutputs[p.VInputName]
+
+	// When K is already transposed (K^T in [batch, numKVHeads, headDim, kvLen] layout),
+	// swap the last two dims to restore BHSD [batch, numKVHeads, kvLen, headDim].
+	// This happens when the K^T Transpose is inside a pre-scale Mul: DQL(Mul(K^T, scalar)).
+	if p.KIsTransposed {
+		k = TransposeAllDims(k, 0, 1, 3, 2)
+	}
+
+	// When K is in [batch, kvLen, numKVHeads, headDim] layout,
+	// transpose to [batch, numKVHeads, kvLen, headDim] as expected by the fused op.
+	if p.KNeedsHeadsFirst {
+		k = TransposeAllDims(k, 0, 2, 1, 3)
+	}
+
+	var mask *Node
+	if p.MaskInputName != "" {
+		mask = convertedOutputs[p.MaskInputName]
+	}
+
+	result := BackendFusedQuantizedScaledDotProductAttention(
+		q, k, v, mask, p.NumHeads, p.NumKVHeads, backends.AxesLayoutBHSD, p.Scale, false)
+	convertedOutputs[c.outputName] = result
+}
+
+func init() {
+	RegisterFusionDetector(detectQuantizedSDPACandidates)
+}
+
+// detectQuantizedSDPACandidates scans the ONNX graph for the quantized attention chain:
 //
 //	DQL(Q) → MatMulInteger(Q_uint8, K_uint8^T) → Cast → Mul(qk_scale) → [Add(mask)] → Softmax
 //	→ DQL(attn) → MatMulInteger(attn_uint8, V_uint8) → Cast → Mul(av_scale) → output
 //
-// and registers FusionGroups for each match.
-func (m *Model) detectQuantizedSDPAPatterns(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) {
+// and returns FusionCandidates for each match.
+func detectQuantizedSDPACandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+	var candidates []FusionCandidate
 	for _, node := range graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		m.tryMatchQuantizedSDPA(graph, consumers, node)
+		if cand := m.tryMatchQuantizedSDPA(graph, consumers, node); cand != nil {
+			candidates = append(candidates, cand)
+		}
 	}
+	return candidates
 }
 
 // tryMatchQuantizedSDPA attempts to match a quantized SDPA chain starting from matmul1
 // (the candidate Q@K^T MatMulInteger).
-func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matmul1 *protos.NodeProto) {
+func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matmul1 *protos.NodeProto) *quantizedSDPACandidate {
 	mm1Out := matmul1.Output[0]
 
 	// Forward chain: MatMulInteger1 → sole consumer Cast(int32→float32)
 	castNode := soleConsumer(consumers, mm1Out)
 	if castNode == nil || castNode.OpType != "Cast" || len(castNode.Output) == 0 {
-		return
+		return nil
 	}
 	castOut := castNode.Output[0]
 
 	// → sole consumer Mul(·, combined_qk_scale)
 	scaleMulNode := soleConsumer(consumers, castOut)
 	if scaleMulNode == nil || scaleMulNode.OpType != "Mul" || len(scaleMulNode.Output) == 0 {
-		return
+		return nil
 	}
 	scaleMulOut := scaleMulNode.Output[0]
 
 	// → [sole consumer Add(·, mask)] → sole consumer Softmax(axis=-1)
 	nextNode := soleConsumer(consumers, scaleMulOut)
 	if nextNode == nil {
-		return
+		return nil
 	}
 
 	var maskInputName string
@@ -73,61 +125,61 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 		addNode = nextNode
 		maskInputName = otherAddInput(addNode, scaleMulOut)
 		if maskInputName == "" {
-			return
+			return nil
 		}
 		if !m.isMaskRankAcceptable(graph, maskInputName) {
-			return
+			return nil
 		}
 		if len(addNode.Output) == 0 {
-			return
+			return nil
 		}
 		softmaxNode = soleConsumer(consumers, addNode.Output[0])
 		if softmaxNode == nil || softmaxNode.OpType != "Softmax" {
-			return
+			return nil
 		}
 	case "Softmax":
 		softmaxNode = nextNode
 	default:
-		return
+		return nil
 	}
 
 	// Verify softmax axis is -1 (last axis).
 	softmaxAxis := getIntAttrOr(softmaxNode, "axis", -1)
 	if softmaxAxis != -1 {
-		return
+		return nil
 	}
 	if len(softmaxNode.Output) == 0 {
-		return
+		return nil
 	}
 	softmaxOut := softmaxNode.Output[0]
 
 	// Softmax → sole consumer DynamicQuantizeLinear → uint8 attn probs
 	dqlAttn := soleConsumer(consumers, softmaxOut)
 	if dqlAttn == nil || dqlAttn.OpType != "DynamicQuantizeLinear" || len(dqlAttn.Output) < 1 {
-		return
+		return nil
 	}
 	dqlAttnUint8 := dqlAttn.Output[0]
 
 	// DQL attn → sole consumer MatMulInteger2 (attn @ V)
 	matmul2 := soleConsumer(consumers, dqlAttnUint8)
 	if matmul2 == nil || matmul2.OpType != "MatMulInteger" || len(matmul2.Input) < 2 || len(matmul2.Output) == 0 {
-		return
+		return nil
 	}
 	if matmul2.Input[0] != dqlAttnUint8 {
-		return
+		return nil
 	}
 	mm2Out := matmul2.Output[0]
 
 	// MatMulInteger2 → sole consumer Cast → sole consumer Mul → final output
 	castNode2 := soleConsumer(consumers, mm2Out)
 	if castNode2 == nil || castNode2.OpType != "Cast" || len(castNode2.Output) == 0 {
-		return
+		return nil
 	}
 	castOut2 := castNode2.Output[0]
 
 	scaleMulNode2 := soleConsumer(consumers, castOut2)
 	if scaleMulNode2 == nil || scaleMulNode2.OpType != "Mul" || len(scaleMulNode2.Output) == 0 {
-		return
+		return nil
 	}
 	rootOutput := scaleMulNode2.Output[0]
 
@@ -137,7 +189,7 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	qUint8Name := matmul1.Input[0]
 	qDqlNode, ok := m.nodeOutputToNode[qUint8Name]
 	if !ok || qDqlNode.OpType != "DynamicQuantizeLinear" || len(qDqlNode.Input) == 0 {
-		return
+		return nil
 	}
 	qDqlInput := qDqlNode.Input[0]
 
@@ -168,14 +220,14 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	kUint8Name := matmul1.Input[1]
 	kDqlNode, kFloatName, kTransposeNode, kNeedsHeadsFirst, kIsTransposed := m.traceQuantizedKBackward(kUint8Name)
 	if kDqlNode == nil {
-		return
+		return nil
 	}
 
 	// V: matmul2.Input[1] → DQL → V_float
 	vUint8Name := matmul2.Input[1]
 	vDqlNode, vOk := m.nodeOutputToNode[vUint8Name]
 	if !vOk || vDqlNode.OpType != "DynamicQuantizeLinear" || len(vDqlNode.Input) == 0 {
-		return
+		return nil
 	}
 	vFloatName := vDqlNode.Input[0]
 
@@ -237,7 +289,7 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 		}
 	}
 	if hasExternalConsumers(internalOutputsExclRoot, consumers, internalNodes) {
-		return
+		return nil
 	}
 
 	// Extract numHeads/numKVHeads from shape info.
@@ -264,12 +316,11 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 		externalInputs = append(externalInputs, maskInputName)
 	}
 
-	fg := &FusionGroup{
-		Type:                FusionQuantizedSDPA,
-		RootOutputName:      rootOutput,
-		InternalOutputNames: internalOutputs,
-		ExternalInputNames:  externalInputs,
-		Params: &QuantizedSDPAParams{
+	return &quantizedSDPACandidate{
+		outputName:      rootOutput,
+		internalOutputs: internalOutputs,
+		externalInputs:  externalInputs,
+		params: &QuantizedSDPAParams{
 			QInputName:       qFloatName,
 			KInputName:       kFloatName,
 			VInputName:       vFloatName,
@@ -281,8 +332,6 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 			KIsTransposed:    kIsTransposed,
 		},
 	}
-
-	m.detectedFusionGroups[rootOutput] = fg
 }
 
 // traceQuantizedKBackward traces MatMulInteger input[1] backward to find the DQL node,
@@ -357,37 +406,6 @@ func (m *Model) traceQuantizedKBackward(uint8Name string) (dqlNode *protos.NodeP
 	}
 
 	return nil, "", nil, false, false
-}
-
-// emitQuantizedSDPA emits a FusedQuantizedScaledDotProductAttention op.
-func (m *Model) emitQuantizedSDPA(_ *context.Context, g *Graph, fg *FusionGroup, convertedOutputs map[string]*Node) {
-	p := fg.Params.(*QuantizedSDPAParams)
-
-	q := convertedOutputs[p.QInputName]
-	k := convertedOutputs[p.KInputName]
-	v := convertedOutputs[p.VInputName]
-
-	// When K is already transposed (K^T in [batch, numKVHeads, headDim, kvLen] layout),
-	// swap the last two dims to restore BHSD [batch, numKVHeads, kvLen, headDim].
-	// This happens when the K^T Transpose is inside a pre-scale Mul: DQL(Mul(K^T, scalar)).
-	if p.KIsTransposed {
-		k = TransposeAllDims(k, 0, 1, 3, 2)
-	}
-
-	// When K is in [batch, kvLen, numKVHeads, headDim] layout,
-	// transpose to [batch, numKVHeads, kvLen, headDim] as expected by the fused op.
-	if p.KNeedsHeadsFirst {
-		k = TransposeAllDims(k, 0, 2, 1, 3)
-	}
-
-	var mask *Node
-	if p.MaskInputName != "" {
-		mask = convertedOutputs[p.MaskInputName]
-	}
-
-	result := BackendFusedQuantizedScaledDotProductAttention(
-		q, k, v, mask, p.NumHeads, p.NumKVHeads, backends.AxesLayoutBHSD, p.Scale, false)
-	convertedOutputs[fg.RootOutputName] = result
 }
 
 // traceToReshapeForHeadCount traces backward from a tensor name through

@@ -45,7 +45,77 @@ type QuantizedDenseParams struct {
 	HasGelu bool
 }
 
-// detectQuantizedDensePatterns scans the ONNX graph for:
+// quantizedDenseCandidate implements FusionCandidate for quantized dense.
+type quantizedDenseCandidate struct {
+	params          *QuantizedDenseParams
+	outputName      string
+	internalOutputs map[string]bool
+	externalInputs  []string
+}
+
+func (c *quantizedDenseCandidate) Name() string                    { return "QuantizedDense" }
+func (c *quantizedDenseCandidate) Score() float32                   { return 40.0 }
+func (c *quantizedDenseCandidate) OutputNames() []string            { return []string{c.outputName} }
+func (c *quantizedDenseCandidate) InternalOutputs() map[string]bool { return c.internalOutputs }
+func (c *quantizedDenseCandidate) ExternalInputs() []string         { return c.externalInputs }
+
+func (c *quantizedDenseCandidate) Emit(_ *context.Context, g *Graph, convertedOutputs map[string]*Node) {
+	p := c.params
+
+	var floatInput *Node
+	if p.FloatInputName != "" {
+		// DQL-based variant: float input comes directly from DynamicQuantizeLinear's original input.
+		floatInput = convertedOutputs[p.FloatInputName]
+	} else {
+		// DequantizeLinear variant: construct float from quantized A.
+		a := convertedOutputs[p.AInputName]
+		floatInput = ConvertDType(a, dtypes.Float32)
+		if p.AZeroPointName != "" {
+			aZP := convertedOutputs[p.AZeroPointName]
+			aZPFloat := ConvertDType(aZP, dtypes.Float32)
+			if !aZPFloat.IsScalar() && aZPFloat.Rank() == 1 && floatInput.Rank() > 1 {
+				newShape := floatInput.Shape().Clone()
+				for axis := range newShape.Dimensions {
+					if axis != floatInput.Rank()-2 {
+						newShape.Dimensions[axis] = 1
+					}
+				}
+				aZPFloat = Reshape(aZPFloat, newShape.Dimensions...)
+			}
+			floatInput = Sub(floatInput, aZPFloat)
+		}
+	}
+
+	b := convertedOutputs[p.BWeightName]
+	bScale := convertedOutputs[p.BScaleName]
+
+	// Build weight scales: nn.QuantizedDense expects [K, numGroups] where numGroups = ceil(N/groupSize).
+	// For per-tensor quantization (groupSize = N), numGroups = 1, so scales = [K, 1].
+	bScaleFloat := ConvertDType(bScale, dtypes.Float32)
+	fusedScales := ExpandAndBroadcast(bScaleFloat, []int{p.K, 1}, []int{0, 1})
+
+	var bias *Node
+	if p.BiasName != "" {
+		bias = convertedOutputs[p.BiasName]
+	}
+
+	var result *Node
+	if p.HasGelu {
+		result = nn.QuantizedDense(floatInput, b, fusedScales, bias,
+			backends.QuantInt8, p.N, p.N, activations.TypeGelu)
+	} else {
+		result = nn.QuantizedDense(floatInput, b, fusedScales, bias,
+			backends.QuantInt8, p.N, p.N)
+	}
+
+	convertedOutputs[c.outputName] = result
+}
+
+func init() {
+	RegisterFusionDetector(detectQuantizedDenseCandidates)
+}
+
+// detectQuantizedDenseCandidates scans the ONNX graph for:
 //
 //	DynamicQuantizeLinear(float_x) → (uint8_x, a_scale, a_zp)
 //	MatMulInteger(uint8_x, int8_B, a_zp, b_zp) → int32
@@ -54,23 +124,27 @@ type QuantizedDenseParams struct {
 //	Mul(float_result, combined_scale) → output
 //	  optionally followed by Add(bias) and/or decomposed GELU
 //
-// and registers FusionGroups for each match.
-func (m *Model) detectQuantizedDensePatterns(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) {
+// and returns FusionCandidates for each match.
+func detectQuantizedDenseCandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+	var candidates []FusionCandidate
 	for _, node := range graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		m.tryMatchQuantizedDense(graph, consumers, node)
+		if cand := m.tryMatchQuantizedDense(graph, consumers, node); cand != nil {
+			candidates = append(candidates, cand)
+		}
 	}
+	return candidates
 }
 
 // tryMatchQuantizedDense attempts to match the full DynamicQuantizeLinear → MatMulInteger →
 // Cast → Mul(combined_scale) chain, tracing backward through DQL to find the original float
 // input and extracting the constant weight scale from the scale combiner.
-func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto) {
+func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto) *quantizedDenseCandidate {
 	matMulInputs := matMulNode.Input
 	if len(matMulInputs) < 2 {
-		return
+		return nil
 	}
 
 	aName := matMulInputs[0] // uint8 output of DynamicQuantizeLinear
@@ -78,11 +152,11 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 
 	// B (weight) must be a constant 2D int8 tensor.
 	if !m.isConstant(bName) {
-		return
+		return nil
 	}
 	bTP, bFound := m.variableNameToValue[bName]
 	if !bFound || bTP == nil || len(bTP.Dims) != 2 || bTP.DataType != int32(protos.TensorProto_INT8) {
-		return
+		return nil
 	}
 	K := int(bTP.Dims[0])
 	N := int(bTP.Dims[1])
@@ -90,7 +164,7 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	// bZeroPoint must be absent or a zero initializer.
 	if len(matMulInputs) > 3 && matMulInputs[3] != "" {
 		if !m.isZeroInitializer(matMulInputs[3]) {
-			return
+			return nil
 		}
 	}
 
@@ -98,8 +172,7 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	dqlNode, ok := m.nodeOutputToNode[aName]
 	if !ok || dqlNode.OpType != "DynamicQuantizeLinear" || len(dqlNode.Input) == 0 || len(dqlNode.Output) < 2 {
 		// DQL not found — try DequantizeLinear variant instead.
-		m.tryMatchQuantizedDenseDequantLinear(graph, consumers, matMulNode, bName, K, N)
-		return
+		return m.tryMatchQuantizedDenseDequantLinear(graph, consumers, matMulNode, bName, K, N)
 	}
 	floatInputName := dqlNode.Input[0]    // original float32 input
 	aScaleName := dqlNode.Output[1]       // dynamic per-tensor scale
@@ -108,29 +181,29 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	matMulOut := matMulNode.Output[0]
 	castNode := soleConsumer(consumers, matMulOut)
 	if castNode == nil || castNode.OpType != "Cast" || len(castNode.Output) == 0 {
-		return
+		return nil
 	}
 	castOut := castNode.Output[0]
 
 	resultMulNode := soleConsumer(consumers, castOut)
 	if resultMulNode == nil || resultMulNode.OpType != "Mul" || len(resultMulNode.Input) < 2 || len(resultMulNode.Output) == 0 {
-		return
+		return nil
 	}
 
 	// Identify the combined scale input to the result Mul.
 	combinedScaleName := identifyOtherInput(resultMulNode, castOut)
 	if combinedScaleName == "" {
-		return
+		return nil
 	}
 
 	// The combined scale must be produced by Mul(a_scale, B_scale) where B_scale is constant.
 	scaleMulNode, ok := m.nodeOutputToNode[combinedScaleName]
 	if !ok || scaleMulNode.OpType != "Mul" || len(scaleMulNode.Input) < 2 {
-		return
+		return nil
 	}
 	bScaleName := identifyConstantPeer(scaleMulNode, aScaleName, m)
 	if bScaleName == "" {
-		return
+		return nil
 	}
 
 	resultMulOut := resultMulNode.Output[0]
@@ -179,7 +252,7 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 
 	// Check no internal outputs leak to external consumers.
 	if hasExternalConsumers(internalOutputs, consumers, internalNodes) {
-		return
+		return nil
 	}
 
 	// External inputs: the original float, int8 weights, and B's per-tensor scale.
@@ -198,15 +271,12 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 		HasGelu:        hasGelu,
 	}
 
-	fg := &FusionGroup{
-		Type:                FusionQuantizedDense,
-		RootOutputName:      currentOut,
-		InternalOutputNames: internalOutputs,
-		ExternalInputNames:  externalInputs,
-		Params:              params,
+	return &quantizedDenseCandidate{
+		params:          params,
+		outputName:      currentOut,
+		internalOutputs: internalOutputs,
+		externalInputs:  externalInputs,
 	}
-
-	m.detectedFusionGroups[currentOut] = fg
 }
 
 // tryMatchQuantizedDenseDequantLinear attempts to match the alternative pattern:
@@ -216,29 +286,29 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 //
 // This variant is emitted by some ONNX exporters instead of the DQL-based
 // Cast+Mul(a_scale*B_scale) chain. Both are semantically equivalent.
-func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto, bName string, K, N int) {
+func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto, bName string, K, N int) *quantizedDenseCandidate {
 	matMulOut := matMulNode.Output[0]
 	matMulInputs := matMulNode.Input
 
 	// MatMulInteger output must have a sole consumer that is DequantizeLinear.
 	dequantNode := soleConsumer(consumers, matMulOut)
 	if dequantNode == nil || dequantNode.OpType != "DequantizeLinear" || len(dequantNode.Input) < 2 || len(dequantNode.Output) == 0 {
-		return
+		return nil
 	}
 
 	// DequantizeLinear must have no zero point.
 	if len(dequantNode.Input) > 2 && dequantNode.Input[2] != "" {
-		return
+		return nil
 	}
 
 	// DequantizeLinear scale must be a constant scalar.
 	scaleName := dequantNode.Input[1]
 	if !m.isConstant(scaleName) {
-		return
+		return nil
 	}
 	scaleTP, scaleFound := m.variableNameToValue[scaleName]
 	if !scaleFound || scaleTP == nil {
-		return
+		return nil
 	}
 	// Scalar: either no dims, or all dims are 1.
 	isScalar := true
@@ -249,7 +319,7 @@ func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, co
 		}
 	}
 	if !isScalar {
-		return
+		return nil
 	}
 
 	dequantOut := dequantNode.Output[0]
@@ -300,7 +370,7 @@ func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, co
 
 	// Check no internal outputs leak to external consumers.
 	if hasExternalConsumers(internalOutputs, consumers, internalNodes) {
-		return
+		return nil
 	}
 
 	// External inputs: quantized A, int8 weights, combined scale, and optionally a_zp.
@@ -323,15 +393,12 @@ func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, co
 		HasGelu:        hasGelu,
 	}
 
-	fg := &FusionGroup{
-		Type:                FusionQuantizedDense,
-		RootOutputName:      currentOut,
-		InternalOutputNames: internalOutputs,
-		ExternalInputNames:  externalInputs,
-		Params:              params,
+	return &quantizedDenseCandidate{
+		params:          params,
+		outputName:      currentOut,
+		internalOutputs: internalOutputs,
+		externalInputs:  externalInputs,
 	}
-
-	m.detectedFusionGroups[currentOut] = fg
 }
 
 // identifyOtherInput returns the Mul/Add input that is NOT knownInput.
@@ -503,59 +570,4 @@ func (m *Model) getOtherMulConstant(mulNode *protos.NodeProto, knownInput string
 		return 0
 	}
 	return m.tryGetConstantScalar(otherName)
-}
-
-// emitQuantizedDense emits a QuantizedDense op (with optional bias and GELU activation)
-// for the given fusion group. It passes the original float32 input and int8 weights to
-// nn.QuantizedDense, which handles quantization internally.
-func (m *Model) emitQuantizedDense(_ *context.Context, g *Graph, fg *FusionGroup, convertedOutputs map[string]*Node) {
-	p := fg.Params.(*QuantizedDenseParams)
-
-	var floatInput *Node
-	if p.FloatInputName != "" {
-		// DQL-based variant: float input comes directly from DynamicQuantizeLinear's original input.
-		floatInput = convertedOutputs[p.FloatInputName]
-	} else {
-		// DequantizeLinear variant: construct float from quantized A.
-		a := convertedOutputs[p.AInputName]
-		floatInput = ConvertDType(a, dtypes.Float32)
-		if p.AZeroPointName != "" {
-			aZP := convertedOutputs[p.AZeroPointName]
-			aZPFloat := ConvertDType(aZP, dtypes.Float32)
-			if !aZPFloat.IsScalar() && aZPFloat.Rank() == 1 && floatInput.Rank() > 1 {
-				newShape := floatInput.Shape().Clone()
-				for axis := range newShape.Dimensions {
-					if axis != floatInput.Rank()-2 {
-						newShape.Dimensions[axis] = 1
-					}
-				}
-				aZPFloat = Reshape(aZPFloat, newShape.Dimensions...)
-			}
-			floatInput = Sub(floatInput, aZPFloat)
-		}
-	}
-
-	b := convertedOutputs[p.BWeightName]
-	bScale := convertedOutputs[p.BScaleName]
-
-	// Build weight scales: nn.QuantizedDense expects [K, numGroups] where numGroups = ceil(N/groupSize).
-	// For per-tensor quantization (groupSize = N), numGroups = 1, so scales = [K, 1].
-	bScaleFloat := ConvertDType(bScale, dtypes.Float32)
-	fusedScales := ExpandAndBroadcast(bScaleFloat, []int{p.K, 1}, []int{0, 1})
-
-	var bias *Node
-	if p.BiasName != "" {
-		bias = convertedOutputs[p.BiasName]
-	}
-
-	var result *Node
-	if p.HasGelu {
-		result = nn.QuantizedDense(floatInput, b, fusedScales, bias,
-			backends.QuantInt8, p.N, p.N, activations.TypeGelu)
-	} else {
-		result = nn.QuantizedDense(floatInput, b, fusedScales, bias,
-			backends.QuantInt8, p.N, p.N)
-	}
-
-	convertedOutputs[fg.RootOutputName] = result
 }

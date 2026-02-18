@@ -4,10 +4,6 @@ import (
 	"fmt"
 	"os"
 	"testing"
-
-	"github.com/gomlx/gomlx/backends"
-	_ "github.com/gomlx/gomlx/backends/simplego"
-	_ "github.com/gomlx/gomlx/backends/simplego/highway"
 )
 
 func TestDebugQuantizedDenseDetection(t *testing.T) {
@@ -21,33 +17,39 @@ func TestDebugQuantizedDenseDetection(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	// Count detected fusion groups by type (deduplicate multi-key entries).
-	seen := make(map[*FusionGroup]bool)
-	counts := make(map[FusionType]int)
-	for _, fg := range m.detectedFusionGroups {
-		if seen[fg] {
+	// Count detected fusions by Name (deduplicate multi-key entries).
+	seen := make(map[FusionCandidate]bool)
+	counts := make(map[string]int)
+	for _, cand := range m.detectedFusions {
+		if seen[cand] {
 			continue
 		}
-		seen[fg] = true
-		counts[fg.Type]++
+		seen[cand] = true
+		counts[cand.Name()]++
 	}
 
-	fmt.Printf("Detected fusion groups (unique):\n")
-	fmt.Printf("  SDPA: %d\n", counts[FusionSDPA])
-	fmt.Printf("  QKVDense: %d\n", counts[FusionQKVDense])
-	fmt.Printf("  DenseGelu: %d\n", counts[FusionDenseGelu])
-	fmt.Printf("  QuantizedDense: %d\n", counts[FusionQuantizedDense])
-	fmt.Printf("  QuantizedQKVDense: %d\n", counts[FusionQuantizedQKVDense])
-	fmt.Printf("  QuantizedSDPA: %d\n", counts[FusionQuantizedSDPA])
+	fmt.Printf("Detected fusions (unique):\n")
+	fmt.Printf("  SDPA: %d\n", counts["SDPA"])
+	fmt.Printf("  QKVDense: %d\n", counts["QKVDense"])
+	fmt.Printf("  DenseGelu: %d\n", counts["DenseGelu"])
+	fmt.Printf("  QuantizedDense: %d\n", counts["QuantizedDense"])
+	fmt.Printf("  QuantizedQKVDense: %d\n", counts["QuantizedQKVDense"])
+	fmt.Printf("  QuantizedSDPA: %d\n", counts["QuantizedSDPA"])
 
-	// Print details of QuantizedDense groups.
+	// Print details of QuantizedDense candidates.
 	geluCount := 0
 	biasCount := 0
-	for name, fg := range m.detectedFusionGroups {
-		if fg.Type != FusionQuantizedDense {
+	seen = make(map[FusionCandidate]bool)
+	for name, cand := range m.detectedFusions {
+		if cand.Name() != "QuantizedDense" || seen[cand] {
 			continue
 		}
-		p := fg.Params.(*QuantizedDenseParams)
+		seen[cand] = true
+		qdc, ok := cand.(*quantizedDenseCandidate)
+		if !ok {
+			continue
+		}
+		p := qdc.params
 		flags := ""
 		if p.HasGelu {
 			flags += "+GELU"
@@ -61,74 +63,55 @@ func TestDebugQuantizedDenseDetection(t *testing.T) {
 	}
 	fmt.Printf("  With GELU: %d, with bias: %d\n", geluCount, biasCount)
 
-	// Print details of QuantizedQKVDense groups.
-	seen = make(map[*FusionGroup]bool)
-	for _, fg := range m.detectedFusionGroups {
-		if fg.Type != FusionQuantizedQKVDense || seen[fg] {
+	// Print details of QuantizedQKVDense candidates.
+	seen = make(map[FusionCandidate]bool)
+	for _, cand := range m.detectedFusions {
+		if cand.Name() != "QuantizedQKVDense" || seen[cand] {
 			continue
 		}
-		seen[fg] = true
-		p := fg.Params.(*QuantizedQKVDenseParams)
+		seen[cand] = true
+		qkvc, ok := cand.(*quantizedQKVDenseCandidate)
+		if !ok {
+			continue
+		}
+		p := qkvc.params
 		fmt.Printf("  QQKV: Q=%s K=%s V=%s  [%dx%d]\n",
 			p.QOutputName, p.KOutputName, p.VOutputName, p.K, p.QDim)
 	}
 
 	// Expect 6 QuantizedQKVDense (one per layer) and 18 remaining QuantizedDense
 	// (6 attention_output + 6 FFN_intermediate + 6 FFN_output).
-	if counts[FusionQuantizedQKVDense] != 6 {
-		t.Errorf("Expected 6 QuantizedQKVDense, got %d", counts[FusionQuantizedQKVDense])
+	if counts["QuantizedQKVDense"] != 6 {
+		t.Errorf("Expected 6 QuantizedQKVDense, got %d", counts["QuantizedQKVDense"])
 	}
-	if counts[FusionQuantizedDense] != 18 {
-		t.Errorf("Expected 18 remaining QuantizedDense, got %d", counts[FusionQuantizedDense])
+	if counts["QuantizedDense"] != 18 {
+		t.Errorf("Expected 18 remaining QuantizedDense, got %d", counts["QuantizedDense"])
 	}
 
-	// Verify active fusion groups with simplego backend.
-	engine, err := backends.NewWithConfig("go")
-	if err != nil {
-		t.Skipf("simplego backend not available: %v", err)
+	// In the new framework all detected fusions are active (wrappers handle backend fallback).
+	// Just verify we detected the expected quantized fusions.
+	if counts["QuantizedDense"] == 0 {
+		t.Errorf("Expected QuantizedDense fusions, got 0")
 	}
-	defer engine.Finalize()
-	active := m.buildActiveFusionGroups(engine.Capabilities())
-	activeQD := 0
-	activeQQKV := 0
-	activeQSDPA := 0
-	seen = make(map[*FusionGroup]bool)
-	for _, fg := range active {
-		if seen[fg] {
-			continue
-		}
-		seen[fg] = true
-		switch fg.Type {
-		case FusionQuantizedDense:
-			activeQD++
-		case FusionQuantizedQKVDense:
-			activeQQKV++
-		case FusionQuantizedSDPA:
-			activeQSDPA++
-		}
+	if counts["QuantizedQKVDense"] == 0 {
+		t.Errorf("Expected QuantizedQKVDense fusions, got 0")
 	}
-	fmt.Printf("Active QuantizedDense (simplego): %d\n", activeQD)
-	fmt.Printf("Active QuantizedQKVDense (simplego): %d\n", activeQQKV)
-	fmt.Printf("Active QuantizedSDPA (simplego): %d\n", activeQSDPA)
-
-	if activeQD == 0 {
-		t.Errorf("Expected active QuantizedDense groups, got 0")
-	}
-	if activeQQKV == 0 {
-		t.Errorf("Expected active QuantizedQKVDense groups, got 0")
-	}
-	if activeQSDPA == 0 {
-		t.Errorf("Expected active QuantizedSDPA groups, got 0")
+	if counts["QuantizedSDPA"] == 0 {
+		t.Errorf("Expected QuantizedSDPA fusions, got 0")
 	}
 
 	// Print and verify QuantizedSDPA details.
-	seen = make(map[*FusionGroup]bool)
-	for name, fg := range m.detectedFusionGroups {
-		if fg.Type != FusionQuantizedSDPA || seen[fg] {
+	seen = make(map[FusionCandidate]bool)
+	for name, cand := range m.detectedFusions {
+		if cand.Name() != "QuantizedSDPA" || seen[cand] {
 			continue
 		}
-		seen[fg] = true
-		p := fg.Params.(*QuantizedSDPAParams)
+		seen[cand] = true
+		qsc, ok := cand.(*quantizedSDPACandidate)
+		if !ok {
+			continue
+		}
+		p := qsc.params
 		fmt.Printf("  QSDPA: %s  heads=%d kv_heads=%d scale=%.4f kIsTransposed=%v\n",
 			name, p.NumHeads, p.NumKVHeads, p.Scale, p.KIsTransposed)
 		// MiniLM-L6-v2 has 12 attention heads.

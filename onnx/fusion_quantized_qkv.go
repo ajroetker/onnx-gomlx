@@ -6,6 +6,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
+	"github.com/gomlx/onnx-gomlx/internal/protos"
 )
 
 // QuantizedQKVDenseParams holds parameters for fused Q/K/V int8 projections sharing
@@ -14,9 +15,9 @@ import (
 type QuantizedQKVDenseParams struct {
 	FloatInputName string
 
-	WQName, WKName, WVName          string
+	WQName, WKName, WVName            string
 	ScaleQName, ScaleKName, ScaleVName string
-	BiasQName, BiasKName, BiasVName string
+	BiasQName, BiasKName, BiasVName   string
 
 	QOutputName, KOutputName, VOutputName string
 
@@ -25,153 +26,23 @@ type QuantizedQKVDenseParams struct {
 	KVDim int // K and V output features (must be equal)
 }
 
-// qdEntry pairs a QuantizedDense fusion group with its map key.
-type qdEntry struct {
-	fg  *FusionGroup
-	key string // map key (RootOutputName)
+// quantizedQKVDenseCandidate implements FusionCandidate for fused quantized QKV projection.
+type quantizedQKVDenseCandidate struct {
+	params          *QuantizedQKVDenseParams
+	internalOutputs map[string]bool
+	externalInputs  []string
 }
 
-// detectQuantizedQKVDensePatterns runs after detectQuantizedDensePatterns and merges
-// triplets of QuantizedDense groups that share the same FloatInputName into a single
-// QuantizedQKVDense group. This reduces kernel launches (and SMEGuard transitions)
-// from 3 to 1 per attention layer.
-func (m *Model) detectQuantizedQKVDensePatterns() {
-	// Group existing QuantizedDense fusions by FloatInputName.
-	byInput := make(map[string][]qdEntry)
-	for key, fg := range m.detectedFusionGroups {
-		if fg.Type != FusionQuantizedDense {
-			continue
-		}
-		// Skip groups registered under secondary keys (same pointer, different key).
-		if key != fg.RootOutputName {
-			continue
-		}
-		p := fg.Params.(*QuantizedDenseParams)
-		// Only consider groups without GELU (attention projections don't use GELU).
-		if p.HasGelu {
-			continue
-		}
-		byInput[p.FloatInputName] = append(byInput[p.FloatInputName], qdEntry{fg: fg, key: key})
-	}
-
-	for _, entries := range byInput {
-		if len(entries) != 3 {
-			continue
-		}
-		m.tryMergeQuantizedQKV(entries)
-	}
+func (c *quantizedQKVDenseCandidate) Name() string       { return "QuantizedQKVDense" }
+func (c *quantizedQKVDenseCandidate) Score() float32      { return 70.0 }
+func (c *quantizedQKVDenseCandidate) OutputNames() []string {
+	return []string{c.params.QOutputName, c.params.KOutputName, c.params.VOutputName}
 }
+func (c *quantizedQKVDenseCandidate) InternalOutputs() map[string]bool { return c.internalOutputs }
+func (c *quantizedQKVDenseCandidate) ExternalInputs() []string         { return c.externalInputs }
 
-// tryMergeQuantizedQKV attempts to merge 3 QuantizedDense groups into one QKV group.
-func (m *Model) tryMergeQuantizedQKV(entries []qdEntry) {
-	params := make([]*QuantizedDenseParams, 3)
-	for i, e := range entries {
-		params[i] = e.fg.Params.(*QuantizedDenseParams)
-	}
-
-	// All must share the same K (input features).
-	K := params[0].K
-	for _, p := range params[1:] {
-		if p.K != K {
-			return
-		}
-	}
-
-	// Determine Q, K, V ordering by dimension. If two share the same N and
-	// one differs, the differing one is Q. If all equal, keep appearance order.
-	qIdx, kIdx, vIdx := 0, 1, 2
-	d0, d1, d2 := params[0].N, params[1].N, params[2].N
-	if d0 == d1 && d0 != d2 {
-		qIdx, kIdx, vIdx = 2, 0, 1
-	} else if d0 == d2 && d0 != d1 {
-		qIdx, kIdx, vIdx = 1, 0, 2
-	} else if d1 == d2 && d1 != d0 {
-		qIdx, kIdx, vIdx = 0, 1, 2
-	}
-
-	qP := params[qIdx]
-	kP := params[kIdx]
-	vP := params[vIdx]
-
-	// K and V must have equal N, and QDim must equal KVDim for uniform groupSize.
-	if kP.N != vP.N {
-		return
-	}
-	if qP.N != kP.N {
-		// Non-uniform projection dims (e.g. GQA) — can't use a single groupSize.
-		return
-	}
-
-	// Bias must be all-or-nothing.
-	hasBias := qP.BiasName != "" && kP.BiasName != "" && vP.BiasName != ""
-	noBias := qP.BiasName == "" && kP.BiasName == "" && vP.BiasName == ""
-	if !hasBias && !noBias {
-		return
-	}
-
-	// Merge internal outputs from all 3 groups.
-	mergedInternalOutputs := make(map[string]bool)
-	for _, e := range entries {
-		for name := range e.fg.InternalOutputNames {
-			mergedInternalOutputs[name] = true
-		}
-		// The 3 individual root outputs become internal to the QKV group.
-		mergedInternalOutputs[e.fg.RootOutputName] = true
-	}
-
-	externalInputs := []string{
-		qP.FloatInputName,
-		qP.BWeightName, kP.BWeightName, vP.BWeightName,
-		qP.BScaleName, kP.BScaleName, vP.BScaleName,
-	}
-	if hasBias {
-		externalInputs = append(externalInputs, qP.BiasName, kP.BiasName, vP.BiasName)
-	}
-
-	qkvParams := &QuantizedQKVDenseParams{
-		FloatInputName: qP.FloatInputName,
-		WQName:         qP.BWeightName,
-		WKName:         kP.BWeightName,
-		WVName:         vP.BWeightName,
-		ScaleQName:     qP.BScaleName,
-		ScaleKName:     kP.BScaleName,
-		ScaleVName:     vP.BScaleName,
-		QOutputName:    entries[qIdx].fg.RootOutputName,
-		KOutputName:    entries[kIdx].fg.RootOutputName,
-		VOutputName:    entries[vIdx].fg.RootOutputName,
-		K:              K,
-		QDim:           qP.N,
-		KVDim:          kP.N,
-	}
-	if hasBias {
-		qkvParams.BiasQName = qP.BiasName
-		qkvParams.BiasKName = kP.BiasName
-		qkvParams.BiasVName = vP.BiasName
-	}
-
-	fg := &FusionGroup{
-		Type:                FusionQuantizedQKVDense,
-		RootOutputName:      qkvParams.QOutputName,
-		InternalOutputNames: mergedInternalOutputs,
-		ExternalInputNames:  externalInputs,
-		Params:              qkvParams,
-	}
-
-	// Remove the 3 individual QuantizedDense groups.
-	for _, e := range entries {
-		delete(m.detectedFusionGroups, e.key)
-	}
-
-	// Register the QKV group under all 3 output names.
-	m.detectedFusionGroups[qkvParams.QOutputName] = fg
-	m.detectedFusionGroups[qkvParams.KOutputName] = fg
-	m.detectedFusionGroups[qkvParams.VOutputName] = fg
-}
-
-// emitQuantizedQKVDense emits a single QuantizedDense call with concatenated Q/K/V
-// weights and splits the output into Q, K, V tensors.
-func (m *Model) emitQuantizedQKVDense(_ *context.Context, g *Graph, fg *FusionGroup, convertedOutputs map[string]*Node) {
-	p := fg.Params.(*QuantizedQKVDenseParams)
+func (c *quantizedQKVDenseCandidate) Emit(_ *context.Context, g *Graph, convertedOutputs map[string]*Node) {
+	p := c.params
 
 	floatInput := convertedOutputs[p.FloatInputName]
 	wQ := convertedOutputs[p.WQName]
@@ -211,4 +82,138 @@ func (m *Model) emitQuantizedQKVDense(_ *context.Context, g *Graph, fg *FusionGr
 	convertedOutputs[p.QOutputName] = parts[0]
 	convertedOutputs[p.KOutputName] = parts[1]
 	convertedOutputs[p.VOutputName] = parts[2]
+}
+
+func init() {
+	RegisterFusionDetector(detectQuantizedQKVDenseCandidates)
+}
+
+// detectQuantizedQKVDenseCandidates runs the individual quantized dense detector internally,
+// then merges triplets of QuantizedDense candidates sharing the same FloatInputName into
+// a single QuantizedQKVDense candidate. This reduces kernel launches (and SMEGuard transitions)
+// from 3 to 1 per attention layer.
+func detectQuantizedQKVDenseCandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+	// First, get all individual QuantizedDense candidates.
+	var qdCandidates []*quantizedDenseCandidate
+	for _, node := range graph.Node {
+		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
+			continue
+		}
+		if cand := m.tryMatchQuantizedDense(graph, consumers, node); cand != nil {
+			qdCandidates = append(qdCandidates, cand)
+		}
+	}
+
+	// Group by FloatInputName. Only consider groups without GELU (attention projections don't use GELU).
+	byInput := make(map[string][]*quantizedDenseCandidate)
+	for _, cand := range qdCandidates {
+		p := cand.params
+		if p.HasGelu || p.FloatInputName == "" {
+			continue
+		}
+		byInput[p.FloatInputName] = append(byInput[p.FloatInputName], cand)
+	}
+
+	var candidates []FusionCandidate
+	for _, entries := range byInput {
+		if len(entries) != 3 {
+			continue
+		}
+		if cand := tryMergeQuantizedQKV(entries); cand != nil {
+			candidates = append(candidates, cand)
+		}
+	}
+	return candidates
+}
+
+// tryMergeQuantizedQKV attempts to merge 3 QuantizedDense candidates into one QKV candidate.
+func tryMergeQuantizedQKV(entries []*quantizedDenseCandidate) *quantizedQKVDenseCandidate {
+	params := make([]*QuantizedDenseParams, 3)
+	for i, e := range entries {
+		params[i] = e.params
+	}
+
+	// All must share the same K (input features).
+	K := params[0].K
+	for _, p := range params[1:] {
+		if p.K != K {
+			return nil
+		}
+	}
+
+	// Determine Q, K, V ordering by dimension. If two share the same N and
+	// one differs, the differing one is Q. If all equal, keep appearance order.
+	qIdx, kIdx, vIdx := 0, 1, 2
+	d0, d1, d2 := params[0].N, params[1].N, params[2].N
+	if d0 == d1 && d0 != d2 {
+		qIdx, kIdx, vIdx = 2, 0, 1
+	} else if d0 == d2 && d0 != d1 {
+		qIdx, kIdx, vIdx = 1, 0, 2
+	} else if d1 == d2 && d1 != d0 {
+		qIdx, kIdx, vIdx = 0, 1, 2
+	}
+
+	qP := params[qIdx]
+	kP := params[kIdx]
+	vP := params[vIdx]
+
+	// K and V must have equal N, and QDim must equal KVDim for uniform groupSize.
+	if kP.N != vP.N {
+		return nil
+	}
+	if qP.N != kP.N {
+		// Non-uniform projection dims (e.g. GQA) — can't use a single groupSize.
+		return nil
+	}
+
+	// Bias must be all-or-nothing.
+	hasBias := qP.BiasName != "" && kP.BiasName != "" && vP.BiasName != ""
+	noBias := qP.BiasName == "" && kP.BiasName == "" && vP.BiasName == ""
+	if !hasBias && !noBias {
+		return nil
+	}
+
+	// Merge internal outputs from all 3 groups, plus their root outputs become internal.
+	mergedInternalOutputs := make(map[string]bool)
+	for _, e := range entries {
+		for name := range e.internalOutputs {
+			mergedInternalOutputs[name] = true
+		}
+	}
+
+	externalInputs := []string{
+		qP.FloatInputName,
+		qP.BWeightName, kP.BWeightName, vP.BWeightName,
+		qP.BScaleName, kP.BScaleName, vP.BScaleName,
+	}
+	if hasBias {
+		externalInputs = append(externalInputs, qP.BiasName, kP.BiasName, vP.BiasName)
+	}
+
+	qkvParams := &QuantizedQKVDenseParams{
+		FloatInputName: qP.FloatInputName,
+		WQName:         qP.BWeightName,
+		WKName:         kP.BWeightName,
+		WVName:         vP.BWeightName,
+		ScaleQName:     qP.BScaleName,
+		ScaleKName:     kP.BScaleName,
+		ScaleVName:     vP.BScaleName,
+		QOutputName:    entries[qIdx].outputName,
+		KOutputName:    entries[kIdx].outputName,
+		VOutputName:    entries[vIdx].outputName,
+		K:              K,
+		QDim:           qP.N,
+		KVDim:          kP.N,
+	}
+	if hasBias {
+		qkvParams.BiasQName = qP.BiasName
+		qkvParams.BiasKName = kP.BiasName
+		qkvParams.BiasVName = vP.BiasName
+	}
+
+	return &quantizedQKVDenseCandidate{
+		params:          qkvParams,
+		internalOutputs: mergedInternalOutputs,
+		externalInputs:  externalInputs,
+	}
 }
