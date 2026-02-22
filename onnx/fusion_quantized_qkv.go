@@ -53,7 +53,8 @@ func (c *quantizedQKVDenseCandidate) Emit(_ *context.Context, g *Graph, converte
 	scaleK := convertedOutputs[p.ScaleKName]
 	scaleV := convertedOutputs[p.ScaleVName]
 
-	// Concatenate int8 weights: [K, QDim] + [K, KVDim] + [K, KVDim] → [K, 3*QDim]
+	// Concatenate int8 weights: [K, QDim] + [K, KVDim] + [K, KVDim] → [K, totalN]
+	// Note: QDim == KVDim is enforced by tryMergeQuantizedQKV, so totalN = 3*QDim.
 	wQKV := Concatenate([]*Node{wQ, wK, wV}, 1)
 	totalN := p.QDim + 2*p.KVDim
 	groupSize := p.QDim // Each projection is one quantization group.
