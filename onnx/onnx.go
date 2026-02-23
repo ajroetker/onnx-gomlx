@@ -53,6 +53,10 @@ type Model struct {
 	// It is initialized lazily when external data is first accessed.
 	externalDataReader *ExternalDataReader
 
+	// consumers maps output names to the nodes that consume them. Built during detectFusionPatterns
+	// and used by fusion detectors to walk the graph.
+	consumers map[string][]*protos.NodeProto
+
 	// detectedFusions maps output names to detected fusion candidates (SDPA, QKV Dense, Dense+Gelu).
 	// Populated by detectFusionPatterns during Parse. The GoMLX wrapper functions
 	// (attention.Core, attention.QKVProjection, nn.Dense) handle fused-vs-decomposed

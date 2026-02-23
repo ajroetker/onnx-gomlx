@@ -1,11 +1,28 @@
+// fusion_sdpa.go implements detection and emission of Scaled Dot-Product Attention (SDPA)
+// fusion patterns. It covers the following model families and variants:
+//
+// Standard (post-scaled) SDPA:
+//
+//	MatMul(Q, K^T) → Div/Mul(·, scale) → [Add(·, mask)] → Softmax(-1) → MatMul(·, V)
+//	Used by: BERT, GPT-2, RoBERTa, DistilBERT, standard Hugging Face transformers
+//
+// Pre-scaled SDPA:
+//
+//	Mul(Q, s), Mul(K^T, s) → MatMul(·, ·) → [Add(mask)] → Softmax(-1) → MatMul(·, V)
+//	Used by: Snowflake arctic-embed models, some ONNX exports from PyTorch with pre-scaling
+//
+// Combined heads-first + K^T transpose (perm [0,2,3,1]):
+//
+//	Used by: Models exported with heads in non-standard axis layout (Snowflake variants)
+//
+// Grouped Query Attention (GQA) is supported when NumHeads != NumKVHeads.
 package onnx
 
 import (
-	"math"
-
 	. "github.com/gomlx/gomlx/pkg/core/graph" //nolint
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
+	"github.com/gomlx/onnx-gomlx/internal/onnxgraph"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 )
 
@@ -61,25 +78,22 @@ func init() {
 	RegisterFusionDetector(detectSDPACandidates)
 }
 
-// detectSDPACandidates scans the ONNX graph for decomposed scaled dot-product attention:
-//
-//	MatMul(Q, K^T) → Div/Mul(·, scale) → [Add(·, mask)] → Softmax(·, axis=-1) → MatMul(·, V)
-//
+// detectSDPACandidates scans the ONNX graph for decomposed scaled dot-product attention
 // and returns FusionCandidates for each match.
-func detectSDPACandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+func detectSDPACandidates(m *Model) []FusionCandidate {
 	var candidates []FusionCandidate
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMul" {
 			continue
 		}
-		if cand := m.tryMatchSDPA(graph, consumers, node); cand != nil {
+		if cand := m.sdpaTryMatch(node); cand != nil {
 			candidates = append(candidates, cand)
 		}
 	}
 	return candidates
 }
 
-// tryMatchSDPA attempts to match an SDPA chain starting from matmul1 (the Q@K^T multiplication).
+// sdpaTryMatch attempts to match an SDPA chain starting from matmul1 (the Q@K^T multiplication).
 // It supports two patterns:
 //
 // Post-scaled (standard): MatMul(Q, K^T) → Div/Mul(·, scale) → [Add(mask)] → Softmax(-1) → MatMul(·, V)
@@ -87,7 +101,8 @@ func detectSDPACandidates(m *Model, graph *protos.GraphProto, consumers map[stri
 //
 // In the pre-scaled pattern, both Q and K inputs to MatMul1 come from Mul(·, scalar)
 // with the same scalar constant, and the effective scale is scalar².
-func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matmul1 *protos.NodeProto) *sdpaCandidate {
+func (m *Model) sdpaTryMatch(matmul1 *protos.NodeProto) *sdpaCandidate {
+	consumers := m.consumers
 	if len(matmul1.Output) == 0 {
 		return nil
 	}
@@ -98,19 +113,19 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	}
 
 	// Try to match K^T: either direct Transpose, or Mul(Transpose(...), scalar).
-	kTransposeNode, kInputName := m.matchKTranspose(matmul1.Input[1])
+	kTransposeNode, kInputName := m.sdpaMatchKTranspose(matmul1.Input[1])
 	var kPreScaleMulNode *protos.NodeProto
 	var kNeedsHeadsFirst bool
 	if kTransposeNode == nil {
 		// Try pre-scaled K: Mul(Transpose(...), scalar)
-		kPreScaleMulNode, kTransposeNode, kInputName, kNeedsHeadsFirst = m.matchPreScaledKTranspose(matmul1.Input[1])
+		kPreScaleMulNode, kTransposeNode, kInputName, kNeedsHeadsFirst = m.sdpaMatchPreScaledKTranspose(matmul1.Input[1])
 		if kTransposeNode == nil {
 			return nil
 		}
 	}
 
 	// Follow chain from MatMul1 output.
-	scaleConsumer := soleConsumer(consumers, m1Out)
+	scaleConsumer := onnxgraph.SoleConsumer(consumers, m1Out)
 	if scaleConsumer == nil {
 		return nil
 	}
@@ -122,12 +137,12 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	switch scaleConsumer.OpType {
 	case "Div":
 		// Post-scaled: MatMul → Div
-		scale = m.extractScaleFromDiv(scaleConsumer)
+		scale = m.sdpaExtractScaleFromDiv(scaleConsumer)
 		scaleNode = scaleConsumer
 	case "Mul":
 		// Could be post-scaled: MatMul → Mul(·, scalar)
 		// Check if this Mul has a constant scalar input (post-scale).
-		postScale := m.extractScaleFromMul(scaleConsumer)
+		postScale := m.sdpaExtractScaleFromMul(scaleConsumer)
 		if postScale != 0 {
 			scale = postScale
 			scaleNode = scaleConsumer
@@ -139,7 +154,7 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 		if kPreScaleMulNode == nil {
 			return nil // K wasn't pre-scaled, and there's no post-scale → not SDPA
 		}
-		scale = m.extractPreScale(matmul1.Input[0], kPreScaleMulNode)
+		scale = m.sdpaExtractPreScale(matmul1.Input[0], kPreScaleMulNode)
 		if scale == 0 {
 			return nil
 		}
@@ -163,7 +178,7 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	// Next consumer: either Add (mask) then Softmax, or directly Softmax.
 	var nextNode *protos.NodeProto
 	if scaleNode != nil {
-		nextNode = soleConsumer(consumers, afterScaleOut)
+		nextNode = onnxgraph.SoleConsumer(consumers, afterScaleOut)
 	} else {
 		// Pre-scale pattern: scaleConsumer IS the next node (Add or Softmax).
 		nextNode = scaleConsumer
@@ -180,17 +195,17 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	case "Add":
 		addNode = nextNode
 		// Mask add: one of the Add inputs is afterScaleOut, the other is the mask.
-		maskInputName = otherAddInput(addNode, afterScaleOut)
+		maskInputName = onnxgraph.OtherBinaryOpInput(addNode, afterScaleOut)
 		if maskInputName == "" {
 			return nil
 		}
-		if !m.isMaskRankAcceptable(graph, maskInputName) {
+		if !m.sdpaIsMaskRankAcceptable(maskInputName) {
 			return nil
 		}
 		if len(addNode.Output) == 0 {
 			return nil
 		}
-		softmaxNode = soleConsumer(consumers, addNode.Output[0])
+		softmaxNode = onnxgraph.SoleConsumer(consumers, addNode.Output[0])
 		if softmaxNode == nil || softmaxNode.OpType != "Softmax" {
 			return nil
 		}
@@ -212,7 +227,7 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	softmaxOut := softmaxNode.Output[0]
 
 	// Final MatMul: Softmax output @ V
-	matmul2 := soleConsumer(consumers, softmaxOut)
+	matmul2 := onnxgraph.SoleConsumer(consumers, softmaxOut)
 	if matmul2 == nil || matmul2.OpType != "MatMul" {
 		return nil
 	}
@@ -247,7 +262,7 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	}
 
 	// Verify no internal output is consumed outside the group.
-	if hasExternalConsumers(internalOutputs, consumers, internalNodes) {
+	if onnxgraph.HasExternalConsumers(internalOutputs, consumers, internalNodes) {
 		return nil
 	}
 
@@ -258,14 +273,20 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	kShapeName := kInputName
 	if kPreScaleMulNode != nil {
 		// Pre-scaled: look through Mul → Transpose for shape.
-		qShapeName = m.lookThroughMulForShapeName(matmul1.Input[0])
-		// kInputName is already the pre-transpose K input from matchPreScaledKTranspose.
+		qShapeName = m.sdpaLookThroughMulForShapeName(matmul1.Input[0])
+		// kInputName is already the pre-transpose K input from sdpaMatchPreScaledKTranspose.
 	}
 	var numHeads, numKVHeads int
 	if kNeedsHeadsFirst {
 		// K is in [batch, kvLen, numKVHeads, headDim] — heads are at axis 2.
-		numHeads = m.extractDimFromShape(graph, qShapeName, 1)
-		numKVHeads = m.extractDimFromShape(graph, kShapeName, 2)
+		qShape := m.ShapeForName(qShapeName)
+		kShape := m.ShapeForName(kShapeName)
+		if len(qShape.Dimensions) > 1 {
+			numHeads = qShape.Dimensions[1]
+		}
+		if len(kShape.Dimensions) > 2 {
+			numKVHeads = kShape.Dimensions[2]
+		}
 		if numHeads <= 0 {
 			numHeads = 1
 		}
@@ -273,7 +294,7 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 			numKVHeads = numHeads
 		}
 	} else {
-		numHeads, numKVHeads = m.extractHeadCounts(graph, qShapeName, kShapeName)
+		numHeads, numKVHeads = m.sdpaExtractHeadCounts(qShapeName, kShapeName)
 	}
 
 	// Build external inputs list.
@@ -282,7 +303,7 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	qInputName := matmul1.Input[0]
 	if kPreScaleMulNode != nil {
 		// Q input is the non-scalar input to Q's Mul.
-		qInputName = m.lookThroughMulForShapeName(matmul1.Input[0])
+		qInputName = m.sdpaLookThroughMulForShapeName(matmul1.Input[0])
 	}
 	externalInputs := []string{qInputName, kInputName, vInputName}
 	if maskInputName != "" {
@@ -306,9 +327,9 @@ func (m *Model) tryMatchSDPA(graph *protos.GraphProto, consumers map[string][]*p
 	}
 }
 
-// matchKTranspose checks if inputName comes from a Transpose node that swaps the last two axes.
+// sdpaMatchKTranspose checks if inputName comes from a Transpose node that swaps the last two axes.
 // Returns the Transpose node and the original (pre-transpose) input name, or nil if not matched.
-func (m *Model) matchKTranspose(inputName string) (*protos.NodeProto, string) {
+func (m *Model) sdpaMatchKTranspose(inputName string) (*protos.NodeProto, string) {
 	node, ok := m.nodeOutputToNode[inputName]
 	if !ok || node.OpType != "Transpose" {
 		return nil, ""
@@ -341,11 +362,11 @@ func (m *Model) matchKTranspose(inputName string) (*protos.NodeProto, string) {
 	return node, node.Input[0]
 }
 
-// matchPreScaledKTranspose checks if inputName comes from Mul(Transpose(...), scalar)
+// sdpaMatchPreScaledKTranspose checks if inputName comes from Mul(Transpose(...), scalar)
 // where the Transpose produces K^T (headDim and kvLen in the last two positions).
 // Returns the Mul node, Transpose node, and the pre-transpose input name; or nil if not matched.
 // kNeedsHeadsFirst is true when K_raw needs a [0,2,1,3] transpose to get to [batch, heads, kvLen, headDim].
-func (m *Model) matchPreScaledKTranspose(inputName string) (mulNode, transposeNode *protos.NodeProto, preTransposeInput string, kNeedsHeadsFirst bool) {
+func (m *Model) sdpaMatchPreScaledKTranspose(inputName string) (mulNode, transposeNode *protos.NodeProto, preTransposeInput string, kNeedsHeadsFirst bool) {
 	node, ok := m.nodeOutputToNode[inputName]
 	if !ok || node.OpType != "Mul" {
 		return nil, nil, "", false
@@ -357,20 +378,20 @@ func (m *Model) matchPreScaledKTranspose(inputName string) (mulNode, transposeNo
 	// One input should be a Transpose, the other a scalar constant.
 	for _, transposeIdx := range []int{0, 1} {
 		scalarIdx := 1 - transposeIdx
-		scalar := m.tryGetConstantScalar(node.Input[scalarIdx])
+		scalar := m.sdpaTryGetConstantScalar(node.Input[scalarIdx])
 		if scalar == 0 {
 			continue
 		}
 
 		// First try: standard K^T (last two axes swapped, e.g. [0,1,3,2]).
-		tNode, preInput := m.matchKTranspose(node.Input[transposeIdx])
+		tNode, preInput := m.sdpaMatchKTranspose(node.Input[transposeIdx])
 		if tNode != nil {
 			return node, tNode, preInput, false
 		}
 
 		// Second try: combined heads-first + K^T (e.g. [0,2,3,1] on [batch, seqLen, heads, headDim]).
 		// This rearranges to [batch, heads, headDim, seqLen] in one step.
-		tNode, preInput, ok := m.matchCombinedKTranspose(node.Input[transposeIdx])
+		tNode, preInput, ok := m.sdpaMatchCombinedKTranspose(node.Input[transposeIdx])
 		if ok {
 			return node, tNode, preInput, true
 		}
@@ -378,11 +399,11 @@ func (m *Model) matchPreScaledKTranspose(inputName string) (mulNode, transposeNo
 	return nil, nil, "", false
 }
 
-// matchCombinedKTranspose matches Transpose with perm [0,2,3,1] which combines
+// sdpaMatchCombinedKTranspose matches Transpose with perm [0,2,3,1] which combines
 // heads-first reordering and K^T in one operation.
 // Input: [batch, kvLen, numKVHeads, headDim] → Output: [batch, numKVHeads, headDim, kvLen]
 // Returns the Transpose node and pre-transpose input name, or (nil, "", false).
-func (m *Model) matchCombinedKTranspose(inputName string) (*protos.NodeProto, string, bool) {
+func (m *Model) sdpaMatchCombinedKTranspose(inputName string) (*protos.NodeProto, string, bool) {
 	node, ok := m.nodeOutputToNode[inputName]
 	if !ok || node.OpType != "Transpose" {
 		return nil, "", false
@@ -404,9 +425,9 @@ func (m *Model) matchCombinedKTranspose(inputName string) (*protos.NodeProto, st
 	return nil, "", false
 }
 
-// extractPreScale extracts the effective scale when both Q and K inputs to MatMul
+// sdpaExtractPreScale extracts the effective scale when both Q and K inputs to MatMul
 // come from Mul(·, scalar) with the same constant scalar. Returns scalar² or 0 if not matched.
-func (m *Model) extractPreScale(qMulOutputName string, kMulNode *protos.NodeProto) float64 {
+func (m *Model) sdpaExtractPreScale(qMulOutputName string, kMulNode *protos.NodeProto) float64 {
 	// Q input should also come from a Mul(·, scalar).
 	qNode, ok := m.nodeOutputToNode[qMulOutputName]
 	if !ok || qNode.OpType != "Mul" {
@@ -417,10 +438,10 @@ func (m *Model) extractPreScale(qMulOutputName string, kMulNode *protos.NodeProt
 	}
 
 	// Extract scalar from Q's Mul.
-	qScalar := m.tryGetConstantScalar(qNode.Input[1])
+	qScalar := m.sdpaTryGetConstantScalar(qNode.Input[1])
 	if qScalar == 0 {
 		// Try the other input.
-		qScalar = m.tryGetConstantScalar(qNode.Input[0])
+		qScalar = m.sdpaTryGetConstantScalar(qNode.Input[0])
 	}
 	if qScalar == 0 {
 		return 0
@@ -430,9 +451,9 @@ func (m *Model) extractPreScale(qMulOutputName string, kMulNode *protos.NodeProt
 	if len(kMulNode.Input) < 2 {
 		return 0
 	}
-	kScalar := m.tryGetConstantScalar(kMulNode.Input[1])
+	kScalar := m.sdpaTryGetConstantScalar(kMulNode.Input[1])
 	if kScalar == 0 {
-		kScalar = m.tryGetConstantScalar(kMulNode.Input[0])
+		kScalar = m.sdpaTryGetConstantScalar(kMulNode.Input[0])
 	}
 	if kScalar == 0 {
 		return 0
@@ -442,9 +463,9 @@ func (m *Model) extractPreScale(qMulOutputName string, kMulNode *protos.NodeProt
 	return qScalar * kScalar
 }
 
-// lookThroughMulForShapeName returns the non-scalar input to a Mul node, which typically
+// sdpaLookThroughMulForShapeName returns the non-scalar input to a Mul node, which typically
 // has shape info (e.g. from a Transpose). Falls back to the original name.
-func (m *Model) lookThroughMulForShapeName(name string) string {
+func (m *Model) sdpaLookThroughMulForShapeName(name string) string {
 	node, ok := m.nodeOutputToNode[name]
 	if !ok || node.OpType != "Mul" {
 		return name
@@ -453,153 +474,72 @@ func (m *Model) lookThroughMulForShapeName(name string) string {
 		return name
 	}
 	// Return the input that is NOT a scalar constant.
-	if m.tryGetConstantScalar(node.Input[1]) != 0 {
+	if m.sdpaTryGetConstantScalar(node.Input[1]) != 0 {
 		return node.Input[0]
 	}
-	if m.tryGetConstantScalar(node.Input[0]) != 0 {
+	if m.sdpaTryGetConstantScalar(node.Input[0]) != 0 {
 		return node.Input[1]
 	}
 	return name
 }
 
-// extractScaleFromDiv extracts the scale factor from a Div node: result = x / divisor → scale = 1/divisor.
-func (m *Model) extractScaleFromDiv(node *protos.NodeProto) float64 {
+// sdpaExtractScaleFromDiv extracts the scale factor from a Div node: result = x / divisor → scale = 1/divisor.
+func (m *Model) sdpaExtractScaleFromDiv(node *protos.NodeProto) float64 {
 	if len(node.Input) < 2 {
 		return 0
 	}
-	divisor := m.tryGetConstantScalar(node.Input[1])
+	divisor := m.sdpaTryGetConstantScalar(node.Input[1])
 	if divisor == 0 {
 		return 0
 	}
 	return 1.0 / divisor
 }
 
-// extractScaleFromMul extracts the scale factor from a Mul node: result = x * scale.
-func (m *Model) extractScaleFromMul(node *protos.NodeProto) float64 {
+// sdpaExtractScaleFromMul extracts the scale factor from a Mul node: result = x * scale.
+func (m *Model) sdpaExtractScaleFromMul(node *protos.NodeProto) float64 {
 	if len(node.Input) < 2 {
 		return 0
 	}
-	return m.tryGetConstantScalar(node.Input[1])
+	return m.sdpaTryGetConstantScalar(node.Input[1])
 }
 
-// tryGetConstantScalar attempts to read a scalar float64 from a constant/initializer.
-func (m *Model) tryGetConstantScalar(name string) float64 {
+// sdpaTryGetConstantScalar attempts to read a scalar float64 from a constant/initializer.
+func (m *Model) sdpaTryGetConstantScalar(name string) float64 {
 	// Check initializers (variables).
 	if tp, ok := m.variableNameToValue[name]; ok {
-		return tensorProtoToScalar(tp)
+		return TensorProtoToScalar(tp)
 	}
 	// Check if it's a Constant node output.
 	if node, ok := m.nodeOutputToNode[name]; ok && node.OpType == "Constant" {
-		return constantNodeToScalar(node)
+		return ConstantNodeToScalar(node)
 	}
 	return 0
 }
 
-// tensorProtoToScalar extracts a scalar float64 from a TensorProto.
-func tensorProtoToScalar(tp *protos.TensorProto) float64 {
-	// Check dims: must be scalar (empty dims or [1]).
-	totalElements := int64(1)
-	for _, d := range tp.Dims {
-		totalElements *= d
-	}
-	if totalElements != 1 {
-		return 0
-	}
-
-	switch tp.DataType {
-	case int32(protos.TensorProto_FLOAT):
-		if len(tp.FloatData) > 0 {
-			return float64(tp.FloatData[0])
-		}
-		if len(tp.RawData) >= 4 {
-			bits := uint32(tp.RawData[0]) | uint32(tp.RawData[1])<<8 | uint32(tp.RawData[2])<<16 | uint32(tp.RawData[3])<<24
-			return float64(math.Float32frombits(bits))
-		}
-	case int32(protos.TensorProto_DOUBLE):
-		if len(tp.DoubleData) > 0 {
-			return tp.DoubleData[0]
-		}
-		if len(tp.RawData) >= 8 {
-			bits := uint64(tp.RawData[0]) | uint64(tp.RawData[1])<<8 | uint64(tp.RawData[2])<<16 |
-				uint64(tp.RawData[3])<<24 | uint64(tp.RawData[4])<<32 | uint64(tp.RawData[5])<<40 |
-				uint64(tp.RawData[6])<<48 | uint64(tp.RawData[7])<<56
-			return math.Float64frombits(bits)
-		}
-	case int32(protos.TensorProto_FLOAT16):
-		if len(tp.RawData) >= 2 {
-			bits := uint16(tp.RawData[0]) | uint16(tp.RawData[1])<<8
-			return float64(math.Float32frombits(halfToFloat32Bits(bits)))
-		}
-	}
-	return 0
-}
-
-// halfToFloat32Bits converts a float16 bit pattern to float32 bits.
-func halfToFloat32Bits(h uint16) uint32 {
-	sign := uint32(h>>15) & 1
-	exp := uint32(h>>10) & 0x1f
-	mant := uint32(h) & 0x3ff
-
-	if exp == 0 {
-		if mant == 0 {
-			return sign << 31
-		}
-		// Denormalized
-		for mant&0x400 == 0 {
-			mant <<= 1
-			exp--
-		}
-		exp++
-		mant &= 0x3ff
-		return (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
-	} else if exp == 0x1f {
-		return (sign << 31) | (0xff << 23) | (mant << 13)
-	}
-	return (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
-}
-
-// constantNodeToScalar extracts a scalar from a Constant op node.
-func constantNodeToScalar(node *protos.NodeProto) float64 {
-	for _, attr := range node.Attribute {
-		if attr.Name == "value" && attr.T != nil {
-			return tensorProtoToScalar(attr.T)
-		}
-		if attr.Name == "value_float" {
-			return float64(attr.F)
-		}
-	}
-	return 0
-}
-
-// isMaskRankAcceptable checks that the mask is rank ≤ 4.
+// sdpaIsMaskRankAcceptable checks that the mask is rank ≤ 4.
 // Rank-2 masks are shared across batches and heads. Rank-3/4 masks are broadcast
 // per batch/head by the backend using strides computed from the mask shape.
 // Returns false if rank is unknown (be conservative and skip fusion).
-func (m *Model) isMaskRankAcceptable(graph *protos.GraphProto, maskName string) bool {
-	rank := m.getOutputRank(graph, maskName)
-	if rank < 0 {
-		// Unknown rank, be conservative and skip fusion.
-		return false
+func (m *Model) sdpaIsMaskRankAcceptable(maskName string) bool {
+	s := m.ShapeForName(maskName)
+	if s.Dimensions == nil {
+		return false // unknown rank, be conservative
 	}
-	return rank <= 4
+	return len(s.Dimensions) <= 4
 }
 
-// getOutputRank tries to determine the rank of a named output from ValueInfo, inputs, or initializers.
-// Returns -1 if unknown.
-func (m *Model) getOutputRank(graph *protos.GraphProto, name string) int {
-	dims := m.getShapeDims(graph, name)
-	if dims == nil {
-		return -1
-	}
-	return len(dims)
-}
-
-// extractHeadCounts tries to determine numHeads and numKVHeads from Q and K shapes.
+// sdpaExtractHeadCounts tries to determine numHeads and numKVHeads from Q and K shapes.
 // The expected shape is [batch, numHeads, seqLen, headDim].
 // Falls back to numHeads=1, numKVHeads=numHeads if shape info is unavailable.
-func (m *Model) extractHeadCounts(graph *protos.GraphProto, qName, kName string) (numHeads, numKVHeads int) {
-	numHeads = m.extractDimFromShape(graph, qName, 1)
-	numKVHeads = m.extractDimFromShape(graph, kName, 1)
+func (m *Model) sdpaExtractHeadCounts(qName, kName string) (numHeads, numKVHeads int) {
+	qShape := m.ShapeForName(qName)
+	kShape := m.ShapeForName(kName)
+	if len(qShape.Dimensions) > 1 {
+		numHeads = qShape.Dimensions[1]
+	}
+	if len(kShape.Dimensions) > 1 {
+		numKVHeads = kShape.Dimensions[1]
+	}
 	if numHeads <= 0 {
 		numHeads = 1
 	}
@@ -607,52 +547,4 @@ func (m *Model) extractHeadCounts(graph *protos.GraphProto, qName, kName string)
 		numKVHeads = numHeads
 	}
 	return
-}
-
-// extractDimFromShape extracts a specific dimension value from the shape of a named output.
-// Returns -1 if unknown or dynamic.
-func (m *Model) extractDimFromShape(graph *protos.GraphProto, name string, dimIdx int) int {
-	shape := m.getShapeDims(graph, name)
-	if shape == nil || dimIdx >= len(shape) {
-		return -1
-	}
-	return shape[dimIdx]
-}
-
-// getShapeDims returns the static dimension sizes for a named output, or nil if unknown.
-// Dynamic dimensions are returned as -1.
-func (m *Model) getShapeDims(graph *protos.GraphProto, name string) []int {
-	sources := [][]*protos.ValueInfoProto{graph.ValueInfo, graph.Input, graph.Output}
-	for _, vis := range sources {
-		for _, vi := range vis {
-			if vi.Name == name {
-				return extractDimsFromValueInfo(vi)
-			}
-		}
-	}
-	if tp, ok := m.variableNameToValue[name]; ok {
-		dims := make([]int, len(tp.Dims))
-		for i, d := range tp.Dims {
-			dims[i] = int(d)
-		}
-		return dims
-	}
-	return nil
-}
-
-// extractDimsFromValueInfo extracts dimension sizes from a ValueInfoProto.
-func extractDimsFromValueInfo(vi *protos.ValueInfoProto) []int {
-	tt, ok := vi.Type.Value.(*protos.TypeProto_TensorType)
-	if !ok || tt.TensorType.Shape == nil {
-		return nil
-	}
-	dims := make([]int, len(tt.TensorType.Shape.Dim))
-	for i, d := range tt.TensorType.Shape.Dim {
-		if dv, ok := d.Value.(*protos.TensorShapeProto_Dimension_DimValue); ok {
-			dims[i] = int(dv.DimValue)
-		} else {
-			dims[i] = -1 // dynamic
-		}
-	}
-	return dims
 }
