@@ -359,8 +359,14 @@ func TestDetectQKVDensePattern(t *testing.T) {
 	require.True(t, ok)
 	p := qkv.params
 	assert.Equal(t, "x", p.SharedInputName)
+	assert.Equal(t, "__fused_wQKV_x", p.WQKVName)
 	assert.Equal(t, 32, p.QDim)
 	assert.Equal(t, 16, p.KVDim)
+
+	// Verify the fused weight was added to the model.
+	assert.Contains(t, m.variableNameToValue, "__fused_wQKV_x")
+	fusedW := m.variableNameToValue["__fused_wQKV_x"]
+	assert.Equal(t, []int64{64, 64}, fusedW.Dims) // 32 + 16 + 16 = 64
 }
 
 // TestDetectQKVDenseWithBias tests QKV Dense detection with bias Add nodes.
@@ -406,6 +412,7 @@ func TestDetectQKVDenseWithBias(t *testing.T) {
 	qkv, ok := cand.(*qkvDenseCandidate)
 	require.True(t, ok)
 	p := qkv.params
+	assert.Equal(t, "__fused_wQKV_x", p.WQKVName)
 	assert.Equal(t, "Bq", p.BiasQName)
 	assert.Equal(t, "Bk", p.BiasKName)
 	assert.Equal(t, "Bv", p.BiasVName)
@@ -557,13 +564,13 @@ func TestDetectDenseGeluPattern(t *testing.T) {
 	require.NotNil(t, cand, "expected fusion for 'gelu_out'")
 	assert.Equal(t, "DenseGelu", cand.Name())
 
-	dg, ok := cand.(*denseGeluCandidate)
+	dg, ok := cand.(*denseActivationCandidate)
 	require.True(t, ok)
 	p := dg.params
 	assert.Equal(t, "x", p.XInputName)
 	assert.Equal(t, "W", p.WeightName)
 	assert.Equal(t, "B", p.BiasName)
-	assert.Equal(t, "gelu_out", p.GeluOutputName)
+	assert.Equal(t, "gelu_out", p.OutputName)
 }
 
 // TestDetectDenseGeluNoBias tests that MatMul → Gelu (no bias) is detected.
@@ -593,7 +600,7 @@ func TestDetectDenseGeluNoBias(t *testing.T) {
 	require.NotNil(t, cand, "expected fusion for 'gelu_out'")
 	assert.Equal(t, "DenseGelu", cand.Name())
 
-	dg, ok := cand.(*denseGeluCandidate)
+	dg, ok := cand.(*denseActivationCandidate)
 	require.True(t, ok)
 	p := dg.params
 	assert.Equal(t, "x", p.XInputName)
@@ -646,6 +653,166 @@ func TestDenseGeluFusionIntegration(t *testing.T) {
 	runFusedVsUnfused(t, graphProto, map[string]*tensors.Tensor{
 		"x": tensors.FromFlatDataAndDimensions(xData, 2, inFeatures),
 	})
+}
+
+// TestFreeUnusedVariables verifies that FreeUnusedVariables removes initializers
+// that are no longer referenced by any node input while retaining fusion-referenced ones.
+func TestFreeUnusedVariables(t *testing.T) {
+	t.Run("RemovesOriginalQKVWeights", func(t *testing.T) {
+		graph := &protos.GraphProto{
+			Input: []*protos.ValueInfoProto{
+				makeValueInfo("x", []int64{1, 64}),
+			},
+			Output: []*protos.ValueInfoProto{
+				makeValueInfo("q_out", []int64{1, 32}),
+				makeValueInfo("k_out", []int64{1, 16}),
+				makeValueInfo("v_out", []int64{1, 16}),
+			},
+			Initializer: []*protos.TensorProto{
+				makeFloatTensorProto("Wq", []int64{64, 32}, make([]float32, 64*32)),
+				makeFloatTensorProto("Wk", []int64{64, 16}, make([]float32, 64*16)),
+				makeFloatTensorProto("Wv", []int64{64, 16}, make([]float32, 64*16)),
+			},
+			Node: []*protos.NodeProto{
+				{OpType: "MatMul", Input: []string{"x", "Wq"}, Output: []string{"q_out"}},
+				{OpType: "MatMul", Input: []string{"x", "Wk"}, Output: []string{"k_out"}},
+				{OpType: "MatMul", Input: []string{"x", "Wv"}, Output: []string{"v_out"}},
+			},
+		}
+
+		m := buildTestModel(t, graph)
+		// Fusion should have detected QKV and created a fused weight.
+		require.Contains(t, m.variableNameToValue, "__fused_wQKV_x")
+
+		m.FreeUnusedVariables()
+
+		// Fused weight should be kept (referenced by fusion external inputs).
+		assert.Contains(t, m.variableNameToValue, "__fused_wQKV_x")
+
+		// Original Wq/Wk/Wv are only referenced by the original MatMul node inputs,
+		// which are still in the graph. So they should be kept too (nodes still reference them).
+		// However, the fused weight should also be present.
+		// All initializers that are referenced by node inputs are kept.
+		for _, init := range m.Proto.Graph.Initializer {
+			// Every remaining initializer should be referenced by something.
+			assert.True(t,
+				m.variableNameToValue[init.Name] != nil,
+				"initializer %q should be in variableNameToValue", init.Name)
+		}
+	})
+
+	t.Run("NoOp", func(t *testing.T) {
+		// A simple graph where all initializers are used.
+		graph := &protos.GraphProto{
+			Input: []*protos.ValueInfoProto{
+				makeValueInfo("x", []int64{2, 64}),
+			},
+			Output: []*protos.ValueInfoProto{
+				makeValueInfo("out", []int64{2, 128}),
+			},
+			Initializer: []*protos.TensorProto{
+				makeFloatTensorProto("W", []int64{64, 128}, make([]float32, 64*128)),
+			},
+			Node: []*protos.NodeProto{
+				{OpType: "MatMul", Input: []string{"x", "W"}, Output: []string{"out"}},
+			},
+		}
+
+		m := buildTestModel(t, graph)
+		initCountBefore := len(m.Proto.Graph.Initializer)
+		m.FreeUnusedVariables()
+		assert.Equal(t, initCountBefore, len(m.Proto.Graph.Initializer))
+	})
+
+	t.Run("RemovesUnusedInitializer", func(t *testing.T) {
+		// Graph with an initializer that no node references.
+		graph := &protos.GraphProto{
+			Input: []*protos.ValueInfoProto{
+				makeValueInfo("x", []int64{2, 64}),
+			},
+			Output: []*protos.ValueInfoProto{
+				makeValueInfo("out", []int64{2, 128}),
+			},
+			Initializer: []*protos.TensorProto{
+				makeFloatTensorProto("W", []int64{64, 128}, make([]float32, 64*128)),
+				makeFloatTensorProto("unused", []int64{10}, make([]float32, 10)),
+			},
+			Node: []*protos.NodeProto{
+				{OpType: "MatMul", Input: []string{"x", "W"}, Output: []string{"out"}},
+			},
+		}
+
+		m := buildTestModel(t, graph)
+		require.Contains(t, m.variableNameToValue, "unused")
+
+		m.FreeUnusedVariables()
+
+		assert.NotContains(t, m.variableNameToValue, "unused")
+		for _, init := range m.Proto.Graph.Initializer {
+			assert.NotEqual(t, "unused", init.Name)
+		}
+		assert.Contains(t, m.variableNameToValue, "W")
+	})
+}
+
+// TestDetectMulScaledSDPAPattern tests SDPA detection with Mul-based post-scaling
+// instead of the typical Div-based scaling.
+func TestDetectMulScaledSDPAPattern(t *testing.T) {
+	// scale = 1/sqrt(8) ≈ 0.35355339
+	scaleVal := float32(1.0 / math.Sqrt(8))
+
+	graph := &protos.GraphProto{
+		Input: []*protos.ValueInfoProto{
+			makeValueInfo("Q", []int64{1, 2, 4, 8}),
+			makeValueInfo("K", []int64{1, 2, 4, 8}),
+			makeValueInfo("V", []int64{1, 2, 4, 8}),
+		},
+		Output: []*protos.ValueInfoProto{
+			makeValueInfo("output", []int64{1, 2, 4, 8}),
+		},
+		Initializer: []*protos.TensorProto{
+			makeScalarFloatTensorProto("scale_val", scaleVal),
+		},
+		ValueInfo: []*protos.ValueInfoProto{
+			makeValueInfo("K_T", []int64{1, 2, 8, 4}),
+			makeValueInfo("qk", []int64{1, 2, 4, 4}),
+			makeValueInfo("qk_scaled", []int64{1, 2, 4, 4}),
+			makeValueInfo("attn_weights", []int64{1, 2, 4, 4}),
+		},
+		Node: []*protos.NodeProto{
+			{
+				OpType: "Transpose", Input: []string{"K"}, Output: []string{"K_T"},
+				Attribute: []*protos.AttributeProto{
+					{Name: "perm", Type: protos.AttributeProto_INTS, Ints: []int64{0, 1, 3, 2}},
+				},
+			},
+			{OpType: "MatMul", Input: []string{"Q", "K_T"}, Output: []string{"qk"}},
+			// Mul instead of Div for scaling.
+			{OpType: "Mul", Input: []string{"qk", "scale_val"}, Output: []string{"qk_scaled"}},
+			{
+				OpType: "Softmax", Input: []string{"qk_scaled"}, Output: []string{"attn_weights"},
+				Attribute: []*protos.AttributeProto{
+					{Name: "axis", Type: protos.AttributeProto_INT, I: -1},
+				},
+			},
+			{OpType: "MatMul", Input: []string{"attn_weights", "V"}, Output: []string{"output"}},
+		},
+	}
+
+	m := buildTestModel(t, graph)
+
+	require.Len(t, m.detectedFusions, 1, "expected 1 fusion")
+	cand := m.detectedFusions["output"]
+	require.NotNil(t, cand)
+	assert.Equal(t, "SDPA", cand.Name())
+
+	sdpa, ok := cand.(*sdpaCandidate)
+	require.True(t, ok)
+	p := sdpa.params
+	assert.Equal(t, "Q", p.QInputName)
+	assert.Equal(t, "K", p.KInputName)
+	assert.Equal(t, "V", p.VInputName)
+	assert.InDelta(t, float64(scaleVal), p.Scale, 1e-6)
 }
 
 // buildTestModel creates a Model from a GraphProto, wiring up all the maps that Parse() normally creates.

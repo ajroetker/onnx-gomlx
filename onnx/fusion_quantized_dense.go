@@ -9,6 +9,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/nn"
+	"github.com/gomlx/onnx-gomlx/internal/onnxgraph"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 )
 
@@ -125,13 +126,13 @@ func init() {
 //	  optionally followed by Add(bias) and/or decomposed GELU
 //
 // and returns FusionCandidates for each match.
-func detectQuantizedDenseCandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+func detectQuantizedDenseCandidates(m *Model) []FusionCandidate {
 	var candidates []FusionCandidate
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		if cand := m.tryMatchQuantizedDense(graph, consumers, node); cand != nil {
+		if cand := m.tryMatchQuantizedDense(node); cand != nil {
 			candidates = append(candidates, cand)
 		}
 	}
@@ -141,7 +142,8 @@ func detectQuantizedDenseCandidates(m *Model, graph *protos.GraphProto, consumer
 // tryMatchQuantizedDense attempts to match the full DynamicQuantizeLinear → MatMulInteger →
 // Cast → Mul(combined_scale) chain, tracing backward through DQL to find the original float
 // input and extracting the constant weight scale from the scale combiner.
-func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto) *quantizedDenseCandidate {
+func (m *Model) tryMatchQuantizedDense(matMulNode *protos.NodeProto) *quantizedDenseCandidate {
+	consumers := m.consumers
 	matMulInputs := matMulNode.Input
 	if len(matMulInputs) < 2 {
 		return nil
@@ -172,20 +174,20 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	dqlNode, ok := m.nodeOutputToNode[aName]
 	if !ok || dqlNode.OpType != "DynamicQuantizeLinear" || len(dqlNode.Input) == 0 || len(dqlNode.Output) < 2 {
 		// DQL not found — try DequantizeLinear variant instead.
-		return m.tryMatchQuantizedDenseDequantLinear(graph, consumers, matMulNode, bName, K, N)
+		return m.tryMatchQuantizedDenseDequantLinear(matMulNode, bName, K, N)
 	}
 	floatInputName := dqlNode.Input[0]    // original float32 input
 	aScaleName := dqlNode.Output[1]       // dynamic per-tensor scale
 
 	// Follow forward: MatMulInteger → sole consumer Cast → sole consumer Mul(combined_scale).
 	matMulOut := matMulNode.Output[0]
-	castNode := soleConsumer(consumers, matMulOut)
+	castNode := onnxgraph.SoleConsumer(consumers, matMulOut)
 	if castNode == nil || castNode.OpType != "Cast" || len(castNode.Output) == 0 {
 		return nil
 	}
 	castOut := castNode.Output[0]
 
-	resultMulNode := soleConsumer(consumers, castOut)
+	resultMulNode := onnxgraph.SoleConsumer(consumers, castOut)
 	if resultMulNode == nil || resultMulNode.OpType != "Mul" || len(resultMulNode.Input) < 2 || len(resultMulNode.Output) == 0 {
 		return nil
 	}
@@ -225,9 +227,9 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	// Check for optional bias Add after the result Mul.
 	var biasName string
 	currentOut := resultMulOut
-	biasConsumer := soleConsumer(consumers, currentOut)
+	biasConsumer := onnxgraph.SoleConsumer(consumers, currentOut)
 	if biasConsumer != nil && biasConsumer.OpType == "Add" && len(biasConsumer.Output) > 0 {
-		otherInput := otherAddInput(biasConsumer, currentOut)
+		otherInput := onnxgraph.OtherBinaryOpInput(biasConsumer, currentOut)
 		if otherInput != "" && m.isConstant(otherInput) {
 			biasName = otherInput
 			internalOutputs[currentOut] = true
@@ -251,7 +253,7 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	}
 
 	// Check no internal outputs leak to external consumers.
-	if hasExternalConsumers(internalOutputs, consumers, internalNodes) {
+	if onnxgraph.HasExternalConsumers(internalOutputs, consumers, internalNodes) {
 		return nil
 	}
 
@@ -286,12 +288,13 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 //
 // This variant is emitted by some ONNX exporters instead of the DQL-based
 // Cast+Mul(a_scale*B_scale) chain. Both are semantically equivalent.
-func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto, bName string, K, N int) *quantizedDenseCandidate {
+func (m *Model) tryMatchQuantizedDenseDequantLinear(matMulNode *protos.NodeProto, bName string, K, N int) *quantizedDenseCandidate {
+	consumers := m.consumers
 	matMulOut := matMulNode.Output[0]
 	matMulInputs := matMulNode.Input
 
 	// MatMulInteger output must have a sole consumer that is DequantizeLinear.
-	dequantNode := soleConsumer(consumers, matMulOut)
+	dequantNode := onnxgraph.SoleConsumer(consumers, matMulOut)
 	if dequantNode == nil || dequantNode.OpType != "DequantizeLinear" || len(dequantNode.Input) < 2 || len(dequantNode.Output) == 0 {
 		return nil
 	}
@@ -343,9 +346,9 @@ func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, co
 	// Check for optional bias Add after DequantizeLinear.
 	var biasName string
 	currentOut := dequantOut
-	biasConsumer := soleConsumer(consumers, currentOut)
+	biasConsumer := onnxgraph.SoleConsumer(consumers, currentOut)
 	if biasConsumer != nil && biasConsumer.OpType == "Add" && len(biasConsumer.Output) > 0 {
-		otherInput := otherAddInput(biasConsumer, currentOut)
+		otherInput := onnxgraph.OtherBinaryOpInput(biasConsumer, currentOut)
 		if otherInput != "" && m.isConstant(otherInput) {
 			biasName = otherInput
 			internalOutputs[currentOut] = true
@@ -369,7 +372,7 @@ func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, co
 	}
 
 	// Check no internal outputs leak to external consumers.
-	if hasExternalConsumers(internalOutputs, consumers, internalNodes) {
+	if onnxgraph.HasExternalConsumers(internalOutputs, consumers, internalNodes) {
 		return nil
 	}
 
@@ -475,18 +478,18 @@ func (m *Model) tryMatchDecomposedGELU(consumers map[string][]*protos.NodeProto,
 	divOut := divNode.Output[0]
 
 	// Div output → sole consumer must be Erf.
-	erfNode := soleConsumer(consumers, divOut)
+	erfNode := onnxgraph.SoleConsumer(consumers, divOut)
 	if erfNode == nil || erfNode.OpType != "Erf" || len(erfNode.Output) == 0 {
 		return
 	}
 	erfOut := erfNode.Output[0]
 
 	// Erf output → sole consumer must be Add(erfOut, 1.0).
-	addNode := soleConsumer(consumers, erfOut)
+	addNode := onnxgraph.SoleConsumer(consumers, erfOut)
 	if addNode == nil || addNode.OpType != "Add" || len(addNode.Output) == 0 {
 		return
 	}
-	addOther := otherAddInput(addNode, erfOut)
+	addOther := onnxgraph.OtherBinaryOpInput(addNode, erfOut)
 	if addOther == "" {
 		return
 	}
@@ -506,7 +509,7 @@ func (m *Model) tryMatchDecomposedGELU(consumers map[string][]*protos.NodeProto,
 	skipMulOut := skipMulNode.Output[0]
 
 	// skipMul output → sole consumer must be Mul(., 0.5).
-	halfMulNode := soleConsumer(consumers, skipMulOut)
+	halfMulNode := onnxgraph.SoleConsumer(consumers, skipMulOut)
 	if halfMulNode == nil || halfMulNode.OpType != "Mul" || len(halfMulNode.Input) < 2 || len(halfMulNode.Output) == 0 {
 		return
 	}

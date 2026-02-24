@@ -4,6 +4,7 @@ import (
 	"github.com/gomlx/gomlx/backends"
 	. "github.com/gomlx/gomlx/pkg/core/graph" //nolint
 	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/onnx-gomlx/internal/onnxgraph"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 )
 
@@ -78,13 +79,13 @@ func init() {
 //	→ DQL(attn) → MatMulInteger(attn_uint8, V_uint8) → Cast → Mul(av_scale) → output
 //
 // and returns FusionCandidates for each match.
-func detectQuantizedSDPACandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+func detectQuantizedSDPACandidates(m *Model) []FusionCandidate {
 	var candidates []FusionCandidate
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		if cand := m.tryMatchQuantizedSDPA(graph, consumers, node); cand != nil {
+		if cand := m.tryMatchQuantizedSDPA(node); cand != nil {
 			candidates = append(candidates, cand)
 		}
 	}
@@ -93,25 +94,26 @@ func detectQuantizedSDPACandidates(m *Model, graph *protos.GraphProto, consumers
 
 // tryMatchQuantizedSDPA attempts to match a quantized SDPA chain starting from matmul1
 // (the candidate Q@K^T MatMulInteger).
-func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matmul1 *protos.NodeProto) *quantizedSDPACandidate {
+func (m *Model) tryMatchQuantizedSDPA(matmul1 *protos.NodeProto) *quantizedSDPACandidate {
+	consumers := m.consumers
 	mm1Out := matmul1.Output[0]
 
 	// Forward chain: MatMulInteger1 → sole consumer Cast(int32→float32)
-	castNode := soleConsumer(consumers, mm1Out)
+	castNode := onnxgraph.SoleConsumer(consumers, mm1Out)
 	if castNode == nil || castNode.OpType != "Cast" || len(castNode.Output) == 0 {
 		return nil
 	}
 	castOut := castNode.Output[0]
 
 	// → sole consumer Mul(·, combined_qk_scale)
-	scaleMulNode := soleConsumer(consumers, castOut)
+	scaleMulNode := onnxgraph.SoleConsumer(consumers, castOut)
 	if scaleMulNode == nil || scaleMulNode.OpType != "Mul" || len(scaleMulNode.Output) == 0 {
 		return nil
 	}
 	scaleMulOut := scaleMulNode.Output[0]
 
 	// → [sole consumer Add(·, mask)] → sole consumer Softmax(axis=-1)
-	nextNode := soleConsumer(consumers, scaleMulOut)
+	nextNode := onnxgraph.SoleConsumer(consumers, scaleMulOut)
 	if nextNode == nil {
 		return nil
 	}
@@ -123,17 +125,17 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	switch nextNode.OpType {
 	case "Add":
 		addNode = nextNode
-		maskInputName = otherAddInput(addNode, scaleMulOut)
+		maskInputName = onnxgraph.OtherBinaryOpInput(addNode, scaleMulOut)
 		if maskInputName == "" {
 			return nil
 		}
-		if !m.isMaskRankAcceptable(graph, maskInputName) {
+		if !m.isMaskRankAcceptable(maskInputName) {
 			return nil
 		}
 		if len(addNode.Output) == 0 {
 			return nil
 		}
-		softmaxNode = soleConsumer(consumers, addNode.Output[0])
+		softmaxNode = onnxgraph.SoleConsumer(consumers, addNode.Output[0])
 		if softmaxNode == nil || softmaxNode.OpType != "Softmax" {
 			return nil
 		}
@@ -154,14 +156,14 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	softmaxOut := softmaxNode.Output[0]
 
 	// Softmax → sole consumer DynamicQuantizeLinear → uint8 attn probs
-	dqlAttn := soleConsumer(consumers, softmaxOut)
+	dqlAttn := onnxgraph.SoleConsumer(consumers, softmaxOut)
 	if dqlAttn == nil || dqlAttn.OpType != "DynamicQuantizeLinear" || len(dqlAttn.Output) < 1 {
 		return nil
 	}
 	dqlAttnUint8 := dqlAttn.Output[0]
 
 	// DQL attn → sole consumer MatMulInteger2 (attn @ V)
-	matmul2 := soleConsumer(consumers, dqlAttnUint8)
+	matmul2 := onnxgraph.SoleConsumer(consumers, dqlAttnUint8)
 	if matmul2 == nil || matmul2.OpType != "MatMulInteger" || len(matmul2.Input) < 2 || len(matmul2.Output) == 0 {
 		return nil
 	}
@@ -171,13 +173,13 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	mm2Out := matmul2.Output[0]
 
 	// MatMulInteger2 → sole consumer Cast → sole consumer Mul → final output
-	castNode2 := soleConsumer(consumers, mm2Out)
+	castNode2 := onnxgraph.SoleConsumer(consumers, mm2Out)
 	if castNode2 == nil || castNode2.OpType != "Cast" || len(castNode2.Output) == 0 {
 		return nil
 	}
 	castOut2 := castNode2.Output[0]
 
-	scaleMulNode2 := soleConsumer(consumers, castOut2)
+	scaleMulNode2 := onnxgraph.SoleConsumer(consumers, castOut2)
 	if scaleMulNode2 == nil || scaleMulNode2.OpType != "Mul" || len(scaleMulNode2.Output) == 0 {
 		return nil
 	}
@@ -288,13 +290,13 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 			internalOutputsExclRoot[k] = v
 		}
 	}
-	if hasExternalConsumers(internalOutputsExclRoot, consumers, internalNodes) {
+	if onnxgraph.HasExternalConsumers(internalOutputsExclRoot, consumers, internalNodes) {
 		return nil
 	}
 
 	// Extract numHeads/numKVHeads from shape info.
 	// First try standard ValueInfo shape extraction.
-	numHeads, numKVHeads := m.extractHeadCounts(graph, qFloatName, kFloatName)
+	numHeads, numKVHeads := m.extractHeadCounts(qFloatName, kFloatName)
 	// If shapes are all dynamic, trace backward through Mul/Transpose/Reshape
 	// to find the head count from the Reshape shape constant.
 	if numHeads <= 1 {

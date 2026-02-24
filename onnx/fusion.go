@@ -5,7 +5,7 @@ import (
 
 	. "github.com/gomlx/gomlx/pkg/core/graph" //nolint
 	"github.com/gomlx/gomlx/pkg/ml/context"
-	"github.com/gomlx/onnx-gomlx/internal/protos"
+	"github.com/gomlx/onnx-gomlx/internal/onnxgraph"
 )
 
 // FusionCandidate represents a detected fusion pattern that can replace multiple ONNX nodes
@@ -29,7 +29,8 @@ type FusionCandidate interface {
 }
 
 // FusionDetector scans an ONNX graph and returns detected fusion candidates.
-type FusionDetector func(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate
+// The detector uses m.Proto.Graph for the graph and m.consumers for the consumer map.
+type FusionDetector func(m *Model) []FusionCandidate
 
 var registeredDetectors []FusionDetector
 
@@ -38,40 +39,16 @@ func RegisterFusionDetector(d FusionDetector) {
 	registeredDetectors = append(registeredDetectors, d)
 }
 
-// buildConsumerMap builds a map from output name to all NodeProto nodes that consume it as input.
-func buildConsumerMap(graph *protos.GraphProto) map[string][]*protos.NodeProto {
-	consumers := make(map[string][]*protos.NodeProto)
-	for _, node := range graph.Node {
-		for _, inputName := range node.Input {
-			if inputName == "" {
-				continue
-			}
-			consumers[inputName] = append(consumers[inputName], node)
-		}
-	}
-	return consumers
-}
-
-// soleConsumer returns the single consumer of outputName, or nil if there are 0 or 2+ consumers.
-func soleConsumer(consumers map[string][]*protos.NodeProto, outputName string) *protos.NodeProto {
-	list := consumers[outputName]
-	if len(list) == 1 {
-		return list[0]
-	}
-	return nil
-}
-
 // detectFusionPatterns runs all registered detectors, sorts candidates by score descending,
 // then greedily selects non-overlapping fusions, populating m.detectedFusions.
 func (m *Model) detectFusionPatterns() {
-	graph := m.Proto.Graph
-	consumers := buildConsumerMap(graph)
+	m.consumers = onnxgraph.BuildConsumerMap(m.Proto.Graph)
 	m.detectedFusions = make(map[string]FusionCandidate)
 
 	// Collect all candidates from all detectors.
 	var allCandidates []FusionCandidate
 	for _, detector := range registeredDetectors {
-		allCandidates = append(allCandidates, detector(m, graph, consumers)...)
+		allCandidates = append(allCandidates, detector(m)...)
 	}
 
 	// Sort by score descending for greedy selection.
@@ -145,32 +122,4 @@ func (m *Model) isFusionGroupOutput(nodeOutputName string) FusionCandidate {
 func (m *Model) DisableFusion() *Model {
 	m.detectedFusions = nil
 	return m
-}
-
-// otherAddInput returns the input to an Add node that is not knownInput.
-// Returns "" if the node doesn't have exactly 2 inputs or knownInput isn't one of them.
-func otherAddInput(addNode *protos.NodeProto, knownInput string) string {
-	if len(addNode.Input) < 2 {
-		return ""
-	}
-	if addNode.Input[0] == knownInput {
-		return addNode.Input[1]
-	}
-	if addNode.Input[1] == knownInput {
-		return addNode.Input[0]
-	}
-	return ""
-}
-
-// hasExternalConsumers checks whether any of the internal outputs of a candidate fusion
-// group are consumed by a node outside the group.
-func hasExternalConsumers(internalOutputs map[string]bool, consumers map[string][]*protos.NodeProto, internalNodes map[*protos.NodeProto]bool) bool {
-	for outputName := range internalOutputs {
-		for _, consumer := range consumers[outputName] {
-			if !internalNodes[consumer] {
-				return true
-			}
-		}
-	}
-	return false
 }
