@@ -80,14 +80,12 @@ func init() {
 //
 // and returns FusionCandidates for each match.
 func detectQuantizedSDPACandidates(m *Model) []FusionCandidate {
-	graph := m.Proto.Graph
-	consumers := m.consumers
 	var candidates []FusionCandidate
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		if cand := m.tryMatchQuantizedSDPA(graph, consumers, node); cand != nil {
+		if cand := m.tryMatchQuantizedSDPA(node); cand != nil {
 			candidates = append(candidates, cand)
 		}
 	}
@@ -96,7 +94,8 @@ func detectQuantizedSDPACandidates(m *Model) []FusionCandidate {
 
 // tryMatchQuantizedSDPA attempts to match a quantized SDPA chain starting from matmul1
 // (the candidate Q@K^T MatMulInteger).
-func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matmul1 *protos.NodeProto) *quantizedSDPACandidate {
+func (m *Model) tryMatchQuantizedSDPA(matmul1 *protos.NodeProto) *quantizedSDPACandidate {
+	consumers := m.consumers
 	mm1Out := matmul1.Output[0]
 
 	// Forward chain: MatMulInteger1 → sole consumer Cast(int32→float32)
@@ -130,7 +129,7 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 		if maskInputName == "" {
 			return nil
 		}
-		if !m.sdpaIsMaskRankAcceptable(maskInputName) {
+		if !m.isMaskRankAcceptable(maskInputName) {
 			return nil
 		}
 		if len(addNode.Output) == 0 {
@@ -205,7 +204,7 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	if qInputFound && qInputNode.OpType == "Mul" && len(qInputNode.Input) >= 2 {
 		for _, scalarIdx := range []int{0, 1} {
 			otherIdx := 1 - scalarIdx
-			scalar := m.sdpaTryGetConstantScalar(qInputNode.Input[scalarIdx])
+			scalar := m.tryGetConstantScalar(qInputNode.Input[scalarIdx])
 			if scalar != 0 {
 				qFloatName = qInputNode.Input[otherIdx]
 				attentionScale = scalar
@@ -297,7 +296,7 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 
 	// Extract numHeads/numKVHeads from shape info.
 	// First try standard ValueInfo shape extraction.
-	numHeads, numKVHeads := m.sdpaExtractHeadCounts(qFloatName, kFloatName)
+	numHeads, numKVHeads := m.extractHeadCounts(qFloatName, kFloatName)
 	// If shapes are all dynamic, trace backward through Mul/Transpose/Reshape
 	// to find the head count from the Reshape shape constant.
 	if numHeads <= 1 {
@@ -363,12 +362,12 @@ func (m *Model) traceQuantizedKBackward(uint8Name string) (dqlNode *protos.NodeP
 		kTransposedFloat := dqlNode.Input[0]
 
 		// Match standard K^T (swap last two axes).
-		tNode, preInput := m.sdpaMatchKTranspose(kTransposedFloat)
+		tNode, preInput := m.matchKTranspose(kTransposedFloat)
 		if tNode != nil {
 			return dqlNode, preInput, tNode, false, false
 		}
 		// Try combined heads-first + K^T (e.g. perm [0,2,3,1]).
-		tNode, preInput, matched := m.sdpaMatchCombinedKTranspose(kTransposedFloat)
+		tNode, preInput, matched := m.matchCombinedKTranspose(kTransposedFloat)
 		if matched {
 			return dqlNode, preInput, tNode, true, false
 		}
@@ -378,12 +377,12 @@ func (m *Model) traceQuantizedKBackward(uint8Name string) (dqlNode *protos.NodeP
 		// the pre-scale, so return the Mul output (K^T_scaled) and flag as transposed.
 		if mulNode, mulOk := m.nodeOutputToNode[kTransposedFloat]; mulOk && mulNode.OpType == "Mul" && len(mulNode.Input) >= 2 {
 			for _, transposeIdx := range []int{0, 1} {
-				tNode, _ = m.sdpaMatchKTranspose(mulNode.Input[transposeIdx])
+				tNode, _ = m.matchKTranspose(mulNode.Input[transposeIdx])
 				if tNode != nil {
 					// Mul(K^T, scalar) — return Mul output as K^T_scaled.
 					return dqlNode, kTransposedFloat, nil, false, true
 				}
-				tNode, _, matched = m.sdpaMatchCombinedKTranspose(mulNode.Input[transposeIdx])
+				tNode, _, matched = m.matchCombinedKTranspose(mulNode.Input[transposeIdx])
 				if matched {
 					// The combined transpose already placed heads in dim 1,
 					// so kNeedsHeadsFirst=false. Only need to swap last two dims.

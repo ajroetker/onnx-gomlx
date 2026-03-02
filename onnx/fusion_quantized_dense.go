@@ -127,14 +127,12 @@ func init() {
 //
 // and returns FusionCandidates for each match.
 func detectQuantizedDenseCandidates(m *Model) []FusionCandidate {
-	graph := m.Proto.Graph
-	consumers := m.consumers
 	var candidates []FusionCandidate
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		if cand := m.tryMatchQuantizedDense(graph, consumers, node); cand != nil {
+		if cand := m.tryMatchQuantizedDense(node); cand != nil {
 			candidates = append(candidates, cand)
 		}
 	}
@@ -144,7 +142,8 @@ func detectQuantizedDenseCandidates(m *Model) []FusionCandidate {
 // tryMatchQuantizedDense attempts to match the full DynamicQuantizeLinear → MatMulInteger →
 // Cast → Mul(combined_scale) chain, tracing backward through DQL to find the original float
 // input and extracting the constant weight scale from the scale combiner.
-func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto) *quantizedDenseCandidate {
+func (m *Model) tryMatchQuantizedDense(matMulNode *protos.NodeProto) *quantizedDenseCandidate {
+	consumers := m.consumers
 	matMulInputs := matMulNode.Input
 	if len(matMulInputs) < 2 {
 		return nil
@@ -175,7 +174,7 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 	dqlNode, ok := m.nodeOutputToNode[aName]
 	if !ok || dqlNode.OpType != "DynamicQuantizeLinear" || len(dqlNode.Input) == 0 || len(dqlNode.Output) < 2 {
 		// DQL not found — try DequantizeLinear variant instead.
-		return m.tryMatchQuantizedDenseDequantLinear(graph, consumers, matMulNode, bName, K, N)
+		return m.tryMatchQuantizedDenseDequantLinear(matMulNode, bName, K, N)
 	}
 	floatInputName := dqlNode.Input[0]    // original float32 input
 	aScaleName := dqlNode.Output[1]       // dynamic per-tensor scale
@@ -289,7 +288,8 @@ func (m *Model) tryMatchQuantizedDense(graph *protos.GraphProto, consumers map[s
 //
 // This variant is emitted by some ONNX exporters instead of the DQL-based
 // Cast+Mul(a_scale*B_scale) chain. Both are semantically equivalent.
-func (m *Model) tryMatchQuantizedDenseDequantLinear(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, matMulNode *protos.NodeProto, bName string, K, N int) *quantizedDenseCandidate {
+func (m *Model) tryMatchQuantizedDenseDequantLinear(matMulNode *protos.NodeProto, bName string, K, N int) *quantizedDenseCandidate {
+	consumers := m.consumers
 	matMulOut := matMulNode.Output[0]
 	matMulInputs := matMulNode.Input
 
@@ -493,7 +493,7 @@ func (m *Model) tryMatchDecomposedGELU(consumers map[string][]*protos.NodeProto,
 	if addOther == "" {
 		return
 	}
-	addConstVal := m.sdpaTryGetConstantScalar(addOther)
+	addConstVal := m.tryGetConstantScalar(addOther)
 	if math.Abs(addConstVal-1.0) > 1e-3 {
 		return
 	}
@@ -545,7 +545,7 @@ func (m *Model) isDivBySqrt2(divNode *protos.NodeProto, xOutputName string) bool
 	if divNode.Input[0] != xOutputName {
 		return false
 	}
-	divisor := m.sdpaTryGetConstantScalar(divNode.Input[1])
+	divisor := m.tryGetConstantScalar(divNode.Input[1])
 	return math.Abs(divisor-math.Sqrt2) < 1e-3
 }
 
@@ -572,5 +572,5 @@ func (m *Model) getOtherMulConstant(mulNode *protos.NodeProto, knownInput string
 	} else {
 		return 0
 	}
-	return m.sdpaTryGetConstantScalar(otherName)
+	return m.tryGetConstantScalar(otherName)
 }

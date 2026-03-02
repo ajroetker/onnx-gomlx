@@ -93,15 +93,13 @@ func init() {
 // a single QuantizedQKVDense candidate. This reduces kernel launches (and SMEGuard transitions)
 // from 3 to 1 per attention layer.
 func detectQuantizedQKVDenseCandidates(m *Model) []FusionCandidate {
-	graph := m.Proto.Graph
-	consumers := m.consumers
 	// First, get all individual QuantizedDense candidates.
 	var qdCandidates []*quantizedDenseCandidate
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
 			continue
 		}
-		if cand := m.tryMatchQuantizedDense(graph, consumers, node); cand != nil {
+		if cand := m.tryMatchQuantizedDense(node); cand != nil {
 			qdCandidates = append(qdCandidates, cand)
 		}
 	}
