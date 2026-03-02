@@ -1,16 +1,19 @@
 package onnx
 
 import (
+	"fmt"
+
 	. "github.com/gomlx/gomlx/pkg/core/graph" //nolint
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers/attention"
+	"github.com/gomlx/onnx-gomlx/internal/onnxgraph"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 )
 
 // QKVDenseParams holds parameters for fused QKV projection.
 type QKVDenseParams struct {
 	SharedInputName                       string
-	WQName, WKName, WVName                string
+	WQKVName                              string // pre-concatenated weight [inFeatures, qDim+2*kvDim]
 	BiasQName, BiasKName, BiasVName       string
 	QOutputName, KOutputName, VOutputName string
 	QDim, KVDim                           int
@@ -35,14 +38,7 @@ func (c *qkvDenseCandidate) Emit(_ *context.Context, g *Graph, convertedOutputs 
 	p := c.params
 
 	x := convertedOutputs[p.SharedInputName]
-	wQ := convertedOutputs[p.WQName]
-	wK := convertedOutputs[p.WKName]
-	wV := convertedOutputs[p.WVName]
-
-	// ONNX MatMul computes x @ W where W is [inFeatures, outDim].
-	// QKVProjection expects wQKV shape [inFeatures, qDim+2*kvDim] — same ONNX convention.
-	// Concatenate along the last axis (output dimension).
-	wQKV := Concatenate([]*Node{wQ, wK, wV}, -1)
+	wQKV := convertedOutputs[p.WQKVName]
 
 	var biasQ, biasK, biasV *Node
 	if p.BiasQName != "" {
@@ -67,10 +63,11 @@ func init() {
 
 // detectQKVDenseCandidates scans for three MatMul nodes sharing the same first input (x)
 // with constant weight second inputs, optionally followed by bias Add nodes.
-func detectQKVDenseCandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+func detectQKVDenseCandidates(m *Model) []FusionCandidate {
+	consumers := m.consumers
 	// Group MatMul nodes by their first input.
 	matmulsByInput := make(map[string][]*protos.NodeProto)
-	for _, node := range graph.Node {
+	for _, node := range m.Proto.Graph.Node {
 		if node.OpType != "MatMul" || len(node.Input) < 2 {
 			continue
 		}
@@ -86,7 +83,7 @@ func detectQKVDenseCandidates(m *Model, graph *protos.GraphProto, consumers map[
 		if len(matmuls) != 3 {
 			continue
 		}
-		if cand := m.tryMatchQKVDense(graph, consumers, sharedInput, matmuls); cand != nil {
+		if cand := m.tryMatchQKVDense(consumers, sharedInput, matmuls); cand != nil {
 			candidates = append(candidates, cand)
 		}
 	}
@@ -94,7 +91,7 @@ func detectQKVDenseCandidates(m *Model, graph *protos.GraphProto, consumers map[
 }
 
 // tryMatchQKVDense attempts to match a QKV Dense fusion pattern from 3 MatMul nodes sharing input x.
-func (m *Model) tryMatchQKVDense(graph *protos.GraphProto, consumers map[string][]*protos.NodeProto, sharedInput string, matmuls []*protos.NodeProto) *qkvDenseCandidate {
+func (m *Model) tryMatchQKVDense(consumers map[string][]*protos.NodeProto, sharedInput string, matmuls []*protos.NodeProto) *qkvDenseCandidate {
 	// All three MatMuls must have constant weight (second input).
 	type projection struct {
 		matmul     *protos.NodeProto
@@ -110,7 +107,7 @@ func (m *Model) tryMatchQKVDense(graph *protos.GraphProto, consumers map[string]
 		if !m.isConstant(weightName) {
 			return nil
 		}
-		dim := m.getWeightOutputDim(graph, weightName)
+		dim := m.getWeightOutputDim(weightName)
 		if dim <= 0 {
 			return nil
 		}
@@ -126,9 +123,9 @@ func (m *Model) tryMatchQKVDense(graph *protos.GraphProto, consumers map[string]
 		}
 
 		// Check for optional bias Add after each MatMul.
-		biasConsumer := soleConsumer(consumers, mm.Output[0])
+		biasConsumer := onnxgraph.SoleConsumer(consumers, mm.Output[0])
 		if biasConsumer != nil && biasConsumer.OpType == "Add" {
-			biasName := otherAddInput(biasConsumer, mm.Output[0])
+			biasName := onnxgraph.OtherBinaryOpInput(biasConsumer, mm.Output[0])
 			if biasName != "" && m.isConstant(biasName) {
 				projs[i].biasName = biasName
 				if len(biasConsumer.Output) > 0 {
@@ -147,14 +144,14 @@ func (m *Model) tryMatchQKVDense(graph *protos.GraphProto, consumers map[string]
 			// The MatMul output is internal (consumed only by the bias Add).
 			internalOutputs[p.matmul.Output[0]] = true
 			// The bias Add node is also internal.
-			biasAddNode := soleConsumer(consumers, p.matmul.Output[0])
+			biasAddNode := onnxgraph.SoleConsumer(consumers, p.matmul.Output[0])
 			if biasAddNode != nil {
 				internalNodes[biasAddNode] = true
 			}
 		}
 	}
 
-	if hasExternalConsumers(internalOutputs, consumers, internalNodes) {
+	if onnxgraph.HasExternalConsumers(internalOutputs, consumers, internalNodes) {
 		return nil
 	}
 
@@ -185,11 +182,25 @@ func (m *Model) tryMatchQKVDense(graph *protos.GraphProto, consumers map[string]
 		return nil
 	}
 
+	// Pre-concatenate Q, K, V weight tensors along the last axis.
+	wQ := m.variableNameToValue[qProj.weightName]
+	wK := m.variableNameToValue[kProj.weightName]
+	wV := m.variableNameToValue[vProj.weightName]
+	if wQ == nil || wK == nil || wV == nil {
+		return nil
+	}
+	wQKV, err := concatenateTensorProtos([]*protos.TensorProto{wQ, wK, wV}, -1)
+	if err != nil {
+		return nil
+	}
+	wQKVName := fmt.Sprintf("__fused_wQKV_%s", sharedInput)
+	wQKV.Name = wQKVName
+	m.Proto.Graph.Initializer = append(m.Proto.Graph.Initializer, wQKV)
+	m.variableNameToValue[wQKVName] = wQKV
+
 	params := &QKVDenseParams{
 		SharedInputName: sharedInput,
-		WQName:          qProj.weightName,
-		WKName:          kProj.weightName,
-		WVName:          vProj.weightName,
+		WQKVName:        wQKVName,
 		BiasQName:       qProj.biasName,
 		BiasKName:       kProj.biasName,
 		BiasVName:       vProj.biasName,
@@ -200,7 +211,7 @@ func (m *Model) tryMatchQKVDense(graph *protos.GraphProto, consumers map[string]
 		KVDim:           kProj.dim,
 	}
 
-	externalInputs := []string{sharedInput, qProj.weightName, kProj.weightName, vProj.weightName}
+	externalInputs := []string{sharedInput, wQKVName}
 	if qProj.biasName != "" {
 		externalInputs = append(externalInputs, qProj.biasName)
 	}
@@ -232,11 +243,11 @@ func (m *Model) isConstant(name string) bool {
 // getWeightOutputDim returns the output dimension of a weight matrix.
 // For a MatMul x @ W where x is [batch, inFeatures] and W is [inFeatures, outFeatures],
 // returns outFeatures. Returns -1 if unknown.
-func (m *Model) getWeightOutputDim(graph *protos.GraphProto, weightName string) int {
-	dims := m.getShapeDims(graph, weightName)
-	if len(dims) < 2 {
+func (m *Model) getWeightOutputDim(weightName string) int {
+	s := m.ShapeForName(weightName)
+	if len(s.Dimensions) < 2 {
 		return -1
 	}
 	// Weight shape is [inFeatures, outFeatures] for standard MatMul.
-	return dims[len(dims)-1]
+	return s.Dimensions[len(s.Dimensions)-1]
 }

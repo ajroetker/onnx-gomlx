@@ -4,6 +4,7 @@ import (
 	"github.com/gomlx/gomlx/backends"
 	. "github.com/gomlx/gomlx/pkg/core/graph" //nolint
 	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/onnx-gomlx/internal/onnxgraph"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 )
 
@@ -78,7 +79,9 @@ func init() {
 //	→ DQL(attn) → MatMulInteger(attn_uint8, V_uint8) → Cast → Mul(av_scale) → output
 //
 // and returns FusionCandidates for each match.
-func detectQuantizedSDPACandidates(m *Model, graph *protos.GraphProto, consumers map[string][]*protos.NodeProto) []FusionCandidate {
+func detectQuantizedSDPACandidates(m *Model) []FusionCandidate {
+	graph := m.Proto.Graph
+	consumers := m.consumers
 	var candidates []FusionCandidate
 	for _, node := range graph.Node {
 		if node.OpType != "MatMulInteger" || len(node.Input) < 2 || len(node.Output) == 0 {
@@ -97,21 +100,21 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	mm1Out := matmul1.Output[0]
 
 	// Forward chain: MatMulInteger1 → sole consumer Cast(int32→float32)
-	castNode := soleConsumer(consumers, mm1Out)
+	castNode := onnxgraph.SoleConsumer(consumers, mm1Out)
 	if castNode == nil || castNode.OpType != "Cast" || len(castNode.Output) == 0 {
 		return nil
 	}
 	castOut := castNode.Output[0]
 
 	// → sole consumer Mul(·, combined_qk_scale)
-	scaleMulNode := soleConsumer(consumers, castOut)
+	scaleMulNode := onnxgraph.SoleConsumer(consumers, castOut)
 	if scaleMulNode == nil || scaleMulNode.OpType != "Mul" || len(scaleMulNode.Output) == 0 {
 		return nil
 	}
 	scaleMulOut := scaleMulNode.Output[0]
 
 	// → [sole consumer Add(·, mask)] → sole consumer Softmax(axis=-1)
-	nextNode := soleConsumer(consumers, scaleMulOut)
+	nextNode := onnxgraph.SoleConsumer(consumers, scaleMulOut)
 	if nextNode == nil {
 		return nil
 	}
@@ -123,17 +126,17 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	switch nextNode.OpType {
 	case "Add":
 		addNode = nextNode
-		maskInputName = otherAddInput(addNode, scaleMulOut)
+		maskInputName = onnxgraph.OtherBinaryOpInput(addNode, scaleMulOut)
 		if maskInputName == "" {
 			return nil
 		}
-		if !m.isMaskRankAcceptable(graph, maskInputName) {
+		if !m.sdpaIsMaskRankAcceptable(maskInputName) {
 			return nil
 		}
 		if len(addNode.Output) == 0 {
 			return nil
 		}
-		softmaxNode = soleConsumer(consumers, addNode.Output[0])
+		softmaxNode = onnxgraph.SoleConsumer(consumers, addNode.Output[0])
 		if softmaxNode == nil || softmaxNode.OpType != "Softmax" {
 			return nil
 		}
@@ -154,14 +157,14 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	softmaxOut := softmaxNode.Output[0]
 
 	// Softmax → sole consumer DynamicQuantizeLinear → uint8 attn probs
-	dqlAttn := soleConsumer(consumers, softmaxOut)
+	dqlAttn := onnxgraph.SoleConsumer(consumers, softmaxOut)
 	if dqlAttn == nil || dqlAttn.OpType != "DynamicQuantizeLinear" || len(dqlAttn.Output) < 1 {
 		return nil
 	}
 	dqlAttnUint8 := dqlAttn.Output[0]
 
 	// DQL attn → sole consumer MatMulInteger2 (attn @ V)
-	matmul2 := soleConsumer(consumers, dqlAttnUint8)
+	matmul2 := onnxgraph.SoleConsumer(consumers, dqlAttnUint8)
 	if matmul2 == nil || matmul2.OpType != "MatMulInteger" || len(matmul2.Input) < 2 || len(matmul2.Output) == 0 {
 		return nil
 	}
@@ -171,13 +174,13 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	mm2Out := matmul2.Output[0]
 
 	// MatMulInteger2 → sole consumer Cast → sole consumer Mul → final output
-	castNode2 := soleConsumer(consumers, mm2Out)
+	castNode2 := onnxgraph.SoleConsumer(consumers, mm2Out)
 	if castNode2 == nil || castNode2.OpType != "Cast" || len(castNode2.Output) == 0 {
 		return nil
 	}
 	castOut2 := castNode2.Output[0]
 
-	scaleMulNode2 := soleConsumer(consumers, castOut2)
+	scaleMulNode2 := onnxgraph.SoleConsumer(consumers, castOut2)
 	if scaleMulNode2 == nil || scaleMulNode2.OpType != "Mul" || len(scaleMulNode2.Output) == 0 {
 		return nil
 	}
@@ -202,7 +205,7 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 	if qInputFound && qInputNode.OpType == "Mul" && len(qInputNode.Input) >= 2 {
 		for _, scalarIdx := range []int{0, 1} {
 			otherIdx := 1 - scalarIdx
-			scalar := m.tryGetConstantScalar(qInputNode.Input[scalarIdx])
+			scalar := m.sdpaTryGetConstantScalar(qInputNode.Input[scalarIdx])
 			if scalar != 0 {
 				qFloatName = qInputNode.Input[otherIdx]
 				attentionScale = scalar
@@ -288,13 +291,13 @@ func (m *Model) tryMatchQuantizedSDPA(graph *protos.GraphProto, consumers map[st
 			internalOutputsExclRoot[k] = v
 		}
 	}
-	if hasExternalConsumers(internalOutputsExclRoot, consumers, internalNodes) {
+	if onnxgraph.HasExternalConsumers(internalOutputsExclRoot, consumers, internalNodes) {
 		return nil
 	}
 
 	// Extract numHeads/numKVHeads from shape info.
 	// First try standard ValueInfo shape extraction.
-	numHeads, numKVHeads := m.extractHeadCounts(graph, qFloatName, kFloatName)
+	numHeads, numKVHeads := m.sdpaExtractHeadCounts(qFloatName, kFloatName)
 	// If shapes are all dynamic, trace backward through Mul/Transpose/Reshape
 	// to find the head count from the Reshape shape constant.
 	if numHeads <= 1 {
@@ -360,12 +363,12 @@ func (m *Model) traceQuantizedKBackward(uint8Name string) (dqlNode *protos.NodeP
 		kTransposedFloat := dqlNode.Input[0]
 
 		// Match standard K^T (swap last two axes).
-		tNode, preInput := m.matchKTranspose(kTransposedFloat)
+		tNode, preInput := m.sdpaMatchKTranspose(kTransposedFloat)
 		if tNode != nil {
 			return dqlNode, preInput, tNode, false, false
 		}
 		// Try combined heads-first + K^T (e.g. perm [0,2,3,1]).
-		tNode, preInput, matched := m.matchCombinedKTranspose(kTransposedFloat)
+		tNode, preInput, matched := m.sdpaMatchCombinedKTranspose(kTransposedFloat)
 		if matched {
 			return dqlNode, preInput, tNode, true, false
 		}
@@ -375,12 +378,12 @@ func (m *Model) traceQuantizedKBackward(uint8Name string) (dqlNode *protos.NodeP
 		// the pre-scale, so return the Mul output (K^T_scaled) and flag as transposed.
 		if mulNode, mulOk := m.nodeOutputToNode[kTransposedFloat]; mulOk && mulNode.OpType == "Mul" && len(mulNode.Input) >= 2 {
 			for _, transposeIdx := range []int{0, 1} {
-				tNode, _ = m.matchKTranspose(mulNode.Input[transposeIdx])
+				tNode, _ = m.sdpaMatchKTranspose(mulNode.Input[transposeIdx])
 				if tNode != nil {
 					// Mul(K^T, scalar) — return Mul output as K^T_scaled.
 					return dqlNode, kTransposedFloat, nil, false, true
 				}
-				tNode, _, matched = m.matchCombinedKTranspose(mulNode.Input[transposeIdx])
+				tNode, _, matched = m.sdpaMatchCombinedKTranspose(mulNode.Input[transposeIdx])
 				if matched {
 					// The combined transpose already placed heads in dim 1,
 					// so kNeedsHeadsFirst=false. Only need to swap last two dims.
