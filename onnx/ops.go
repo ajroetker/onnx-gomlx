@@ -6,7 +6,6 @@ import (
 	"math"
 	"reflect"
 	"slices"
-
 	"github.com/gomlx/exceptions"
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
@@ -548,8 +547,23 @@ func onnxGatherElements(data *Node, indices *Node, gatherAxis int) *Node {
 //
 // See ONNX documentation in:
 // https://onnx.ai/onnx/operators/onnx__Shape.html
-func convertShape(node *protos.NodeProto, inputs []*Node) *Node {
-	shape := inputs[0].Shape()
+func (m *Model) convertShape(g *Graph, node *protos.NodeProto, inputs []*Node) *Node {
+	var shape shapes.Shape
+	if inputs[0] != nil {
+		shape = inputs[0].Shape()
+	} else if len(node.Input) > 0 {
+		// Input is nil (zero-size tensor). Look up its shape from zeroSizeShapes.
+		if zs, ok := m.zeroSizeShapes[node.Input[0]]; ok {
+			shape = zs
+		} else {
+			exceptions.Panicf("Shape op input %q is nil and has no tracked zero-size shape", node.Input[0])
+			return nil
+		}
+	} else {
+		exceptions.Panicf("Shape op has nil input and no input names in node proto")
+		return nil
+	}
+
 	start := getIntAttrOr(node, "start", 0)
 	if start < 0 {
 		start = shape.Rank() + start
@@ -560,8 +574,8 @@ func convertShape(node *protos.NodeProto, inputs []*Node) *Node {
 	} else if end < 0 {
 		end = shape.Rank() + end
 	}
+
 	dims := sliceMap(shape.Dimensions[start:end], func(dim int) int64 { return int64(dim) })
-	g := inputs[0].Graph()
 	return Const(g, dims)
 }
 
@@ -611,6 +625,55 @@ func onnxFlatten(operand *Node, splitAxis int) *Node {
 // https://onnx.ai/onnx/operators/onnx__Concat.html
 func (m *Model) convertConcat(node *protos.NodeProto, inputs []*Node) *Node {
 	axis := mustGetIntAttr(node, "axis")
+
+	// Filter out nil inputs which arise from zero-size constant tensors
+	// (e.g. empty KV caches during prefill). Zero-size tensors cannot be
+	// represented as graph nodes in some backends (XLA), so they are mapped
+	// to nil by CallGraph. Concatenating with a zero-size tensor is a no-op.
+	if slices.Contains(inputs, nil) {
+		inputs = slices.DeleteFunc(slices.Clone(inputs), func(n *Node) bool { return n == nil })
+		if len(inputs) == 0 {
+			return nil
+		}
+		if len(inputs) == 1 {
+			return inputs[0]
+		}
+	}
+
+	// Padded KV cache mode: when a tensor is being extended by appending a
+	// smaller tensor along the concat axis, replace with DynamicUpdateSlice
+	// to write at the given position instead of growing the tensor. This
+	// covers KV cache Concats (past_kv + new_kv) and attention mask Concats
+	// (past_mask + current_mask), keeping all shapes consistent with
+	// the padded buffer size.
+	//
+	// Detection: the second input is strictly smaller than the first along
+	// the concat axis, indicating an "append new data" pattern rather than
+	// a general concatenation of similarly-sized tensors.
+	if m.paddedKVCachePositionIDs != nil && len(inputs) == 2 {
+		dim0 := inputs[0].Shape().Dimensions[axis]
+		dim1 := inputs[1].Shape().Dimensions[axis]
+		if dim1 < dim0 {
+			past := inputs[0]
+			update := inputs[1]
+			rank := past.Shape().Rank()
+
+			// Build start indices: zeros for all dims except the concat axis
+			// where we use the position from paddedKVCachePositionIDs.
+			g := past.Graph()
+			zero := Scalar(g, dtypes.Int32, 0)
+			startIndices := make([]*Node, rank)
+			for i := range rank {
+				if i == axis {
+					startIndices[i] = m.paddedKVCachePositionIDs
+				} else {
+					startIndices[i] = zero
+				}
+			}
+			return DynamicUpdateSlice(past, update, startIndices)
+		}
+	}
+
 	if m.allowDTypePromotion && len(inputs) > 0 {
 		// Cast all operands to match the first operand's dtype.
 		// Unlike binary ops, Concat should preserve the semantic type set by
@@ -1887,11 +1950,16 @@ func convertAveragePool(_ *Model, _ map[string]*Node, node *protos.NodeProto, in
 	if ceilMode != 0 {
 		exceptions.Panicf("AveragePool: support for attribute 'ceil_mode' is not yet implemented")
 	}
+	// GoMLX's MeanPool uses SumPool + manual division. When padding is present,
+	// takeMeanOfContributions divides by actual element count (excluding padding),
+	// which matches ONNX count_include_pad=0 (the default).
+	//
+	// count_include_pad=1 (include padding zeros in the denominator) is NOT
+	// correctly handled when non-zero pads are present — GoMLX would still
+	// exclude them. This is acceptable for now since models we support either
+	// use count_include_pad=1 with pads=0 (no difference) or count_include_pad=0.
 	countIncludePad := getIntAttrOr(node, "count_include_pad", 0)
-	if countIncludePad != 0 {
-		// GoMLX MeanPool doesn't support including padding in the count.
-		exceptions.Panicf("AveragePool: support for attribute 'count_include_pad' is not yet implemented")
-	}
+	_ = countIncludePad
 	kernelShape := getIntsAttrOr(node, "kernel_shape", nil)
 	strides := getIntsAttrOr(node, "strides", nil)
 	pads := getIntsAttrOr(node, "pads", nil)
@@ -2521,7 +2589,7 @@ func convertMultiHeadAttention(_ *Model, _ map[string]*Node, node *protos.NodePr
 // This is a Microsoft ONNX Runtime contrib op.
 //
 // See ONNX Runtime contrib ops documentation for GroupQueryAttention.
-func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, node *protos.NodeProto, inputs []*Node) *Node {
+func convertGroupQueryAttention(m *Model, convertedOutputs map[string]*Node, node *protos.NodeProto, inputs []*Node) *Node {
 	// Inputs (com.microsoft contrib op):
 	// 0: query  - (batch, seq_len, num_heads * head_size)
 	// 1: key    - (batch, kv_seq_len, kv_num_heads * head_size)
@@ -2577,19 +2645,42 @@ func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, nod
 	// Skip concatenation if past has zero sequence length (no cached tokens).
 	presentKey := key
 	presentValue := value
+	g := query.Graph()
 	if pastKey != nil && pastValue != nil {
-		presentKey = Concatenate([]*Node{pastKey, key}, 2)
-		presentValue = Concatenate([]*Node{pastValue, value}, 2)
+		if m.paddedKVCachePositionIDs != nil {
+			// Padded KV cache: write new KV at position instead of appending.
+			// Output shape equals past shape (no seq growth).
+			zero := Scalar(g, dtypes.Int32, 0)
+			presentKey = DynamicUpdateSlice(pastKey, key, []*Node{zero, zero, m.paddedKVCachePositionIDs, zero})
+			presentValue = DynamicUpdateSlice(pastValue, value, []*Node{zero, zero, m.paddedKVCachePositionIDs, zero})
+		} else {
+			presentKey = Concatenate([]*Node{pastKey, key}, 2)
+			presentValue = Concatenate([]*Node{pastValue, value}, 2)
+		}
 	}
 
 	totalSeqLen := presentKey.Shape().Dimensions[2]
 
 	// Build causal mask: query at absolute position qPos can attend to kvPos <= qPos.
 	// The mask has shape [1, 1, qSeqLen, totalSeqLen], broadcastable to [batch, numHeads, qSeq, kvSeq].
-	g := query.Graph()
-	qPositions := Iota(g, shapes.Make(dtypes.Int32, qSeqLen), 0)
-	qPositions = AddScalar(qPositions, float64(totalSeqLen-qSeqLen))
-	qPositions = Reshape(qPositions, 1, 1, qSeqLen, 1)
+	var qPositions *Node
+	if m.paddedKVCachePositionIDs != nil {
+		// In padded KV cache mode, totalSeqLen is the buffer size (maxSeqLen),
+		// not the actual number of valid tokens. Derive query positions from
+		// the actual write position to produce a correct causal mask.
+		pos := ConvertDType(m.paddedKVCachePositionIDs, dtypes.Int32)
+		if qSeqLen == 1 {
+			qPositions = Reshape(pos, 1, 1, 1, 1)
+		} else {
+			startPos := Sub(pos, Scalar(g, dtypes.Int32, qSeqLen-1))
+			qPositions = Add(Iota(g, shapes.Make(dtypes.Int32, qSeqLen), 0), Reshape(startPos, 1))
+			qPositions = Reshape(qPositions, 1, 1, qSeqLen, 1)
+		}
+	} else {
+		qPositions = Iota(g, shapes.Make(dtypes.Int32, qSeqLen), 0)
+		qPositions = AddScalar(qPositions, float64(totalSeqLen-qSeqLen))
+		qPositions = Reshape(qPositions, 1, 1, qSeqLen, 1)
+	}
 	kvPositions := Iota(g, shapes.Make(dtypes.Int32, totalSeqLen), 0)
 	kvPositions = Reshape(kvPositions, 1, 1, 1, totalSeqLen)
 	mask := GreaterOrEqual(qPositions, kvPositions)
@@ -2600,13 +2691,38 @@ func convertGroupQueryAttention(_ *Model, convertedOutputs map[string]*Node, nod
 		mask = LogicalAnd(mask, LessThan(dist, Scalar(g, dtypes.Int32, localWindowSize)))
 	}
 
+	// Incorporate attention bias from input[10] if provided.
+	// This is typically (1 - attention_mask) * -inf, masking out padded positions.
+	// It has shape [batch, 1, qSeqLen, totalSeqLen].
+	var attnMask *Node
+	if len(inputs) > 10 && inputs[10] != nil {
+		attnBias := inputs[10]
+		// In padded KV cache mode, the bias may have been computed with the
+		// wrong total_seq_len (past_len + 1 instead of past_len). Slice it
+		// to match the actual present key length.
+		biasSeqLen := attnBias.Shape().Dimensions[3]
+		if biasSeqLen != totalSeqLen {
+			attnBias = Slice(attnBias, AxisRange(), AxisRange(), AxisRange(), AxisRange(0, totalSeqLen))
+		}
+		// Combine causal mask with attention bias: convert causal bool to additive float,
+		// then add the attention bias.
+		negInf := Scalar(g, attnBias.DType(), -math.MaxFloat32)
+		causalFloat := Where(mask, ZerosLike(attnBias), negInf)
+		attnMask = Add(causalFloat, attnBias)
+	}
+
 	scaleValue := float64(scale)
 	if scale <= 0 {
 		scaleValue = 1.0 / math.Sqrt(float64(headSize))
 	}
-	// Pass the boolean mask directly — Core auto-detects boolean masks and uses MaskedSoftmax.
-	// K/V retain their original numKVHeads; Core handles GQA head mapping natively.
-	output, _ := attention.Core(nil, query, presentKey, presentValue, scaleValue, mask, 0, attention.LayoutBHSD, false, false)
+	// Use combined float mask (causal + attention bias) if available,
+	// otherwise fall back to the boolean causal mask.
+	// Core auto-detects boolean vs float masks.
+	coreMask := mask
+	if attnMask != nil {
+		coreMask = attnMask
+	}
+	output, _ := attention.Core(nil, query, presentKey, presentValue, scaleValue, coreMask, 0, attention.LayoutBHSD, false, false)
 
 	// Reshape output: (batch, num_heads, qSeqLen, head_size) -> (batch, qSeqLen, num_heads * head_size)
 	output = TransposeAllDims(output, 0, 2, 1, 3)

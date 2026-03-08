@@ -14,6 +14,8 @@ import (
 
 	"github.com/gomlx/gomlx/backends"
 	"github.com/gomlx/gomlx/backends/simplego"
+	"github.com/gomlx/gomlx/pkg/core/graph"
+	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/support/sets"
 	"github.com/gomlx/onnx-gomlx/internal/protos"
 	"github.com/pkg/errors"
@@ -62,6 +64,28 @@ type Model struct {
 	// (attention.Core, attention.QKVProjection, nn.Dense) handle fused-vs-decomposed
 	// fallback internally, so all detected fusions are always active.
 	detectedFusions map[string]FusionCandidate
+
+	// zeroSizeShapes tracks the shapes of zero-size tensor inputs during CallGraph.
+	// Zero-size tensors (e.g., empty KV caches) cannot be represented as graph
+	// nodes in some backends (XLA), so they are mapped to nil in convertedOutputs.
+	// Op converters (Shape, Concat, etc.) consult this map to handle nil inputs
+	// correctly. Set by CallGraph, cleared when CallGraph returns.
+	zeroSizeShapes map[string]shapes.Shape
+
+	// paddedKVCachePositionIDs enables padded KV cache mode when non-nil.
+	// In this mode, Concat ops that append new key/value entries to past KV
+	// caches are replaced with DynamicUpdateSlice. Instead of growing the
+	// sequence dimension, the new entry is placed at the position given by
+	// this node, keeping the output the same shape as the past cache input.
+	//
+	// This makes internal mask computations (which derive from Shape of
+	// the KV cache) produce correct results with fixed-size padded buffers.
+	//
+	// The node should be a scalar Int32 representing the write position
+	// (typically position_ids[0] for single-token decode).
+	//
+	// Set via WithPaddedKVCache, cleared after CallGraph.
+	paddedKVCachePositionIDs *graph.Node
 }
 
 // Parse parses an ONNX model into an internal representation that can be used to build a GoMLX graph.
@@ -231,6 +255,26 @@ func (m *Model) AllowDTypePromotion() *Model {
 // Only effective when AllowDTypePromotion() is also called.
 func (m *Model) PrioritizeFloat16() *Model {
 	m.prioritizeFloat16 = true
+	return m
+}
+
+// WithPaddedKVCache enables padded KV cache mode for this CallGraph invocation.
+// When enabled, Concat ops that grow the sequence dimension of KV caches
+// (past_key_values.N.key/value → present.N.key/value) are replaced with
+// DynamicUpdateSlice, placing the new entry at the given position instead
+// of appending it.
+//
+// This keeps the output shape equal to the input shape, so internal mask
+// computations that derive from Shape(past_key_values) produce correct
+// results with fixed-size padded buffers.
+//
+// positionIDs should be a scalar Int32 node representing the sequence
+// position at which to write the new KV entry. For single-token decode
+// this is typically position_ids[0] converted to Int32.
+//
+// Call with nil to disable padded KV cache mode.
+func (m *Model) WithPaddedKVCache(positionIDs *graph.Node) *Model {
+	m.paddedKVCachePositionIDs = positionIDs
 	return m
 }
 

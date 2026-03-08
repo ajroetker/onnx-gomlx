@@ -66,6 +66,14 @@ func (m *Model) CallGraph(ctx *context.Context, g *Graph, inputs map[string]*Nod
 	// any discrepancies.
 	// Also, initialize convertedOutputs with the given/converted inputs.
 	convertedOutputs := make(map[string]*Node)
+	// zeroSizeShapes tracks shapes of zero-size tensor inputs that cannot be
+	// represented as graph nodes. Ops like Shape and Concat check this map
+	// to handle zero-size tensors correctly.
+	m.zeroSizeShapes = make(map[string]shapes.Shape)
+	defer func() {
+		m.zeroSizeShapes = nil
+		m.paddedKVCachePositionIDs = nil
+	}()
 	missingInputs := sets.Make[string]()
 	repeatedInputs := sets.Make[string]()
 	unknownInputs := sets.Make[string]()
@@ -79,9 +87,11 @@ func (m *Model) CallGraph(ctx *context.Context, g *Graph, inputs map[string]*Nod
 			if staticValue != nil {
 				// Check if the static value is a zero-size tensor (e.g., empty KV cache).
 				// Zero-size tensors cannot be represented as constants in some backends (e.g., XLA),
-				// so we leave them as nil in convertedOutputs. Op converters must handle nil inputs.
+				// so we leave them as nil in convertedOutputs. Op converters must handle nil inputs
+				// and consult zeroSizeShapes for the original shape.
 				if t, ok := staticValue.(*tensors.Tensor); ok && t.Shape().Size() == 0 {
 					convertedOutputs[inputName] = nil
+					m.zeroSizeShapes[inputName] = t.Shape()
 				} else {
 					inputN = Const(g, staticValue)
 					convertedOutputs[inputName] = inputN
@@ -559,7 +569,7 @@ func (m *Model) convertNode(_ *context.Context, g *Graph, node *protos.NodeProto
 	case "GatherND":
 		result = convertGatherND(node, inputs)
 	case "Shape":
-		result = convertShape(node, inputs)
+		result = m.convertShape(g, node, inputs)
 	case "Size":
 		result = convertSize(inputs)
 	case "Concat":
