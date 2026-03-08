@@ -100,13 +100,18 @@ func (c *quantizedDenseCandidate) Emit(_ *context.Context, g *Graph, convertedOu
 		bias = convertedOutputs[p.BiasName]
 	}
 
+	quant := &Quantization{
+		Scheme:    backends.QuantLinear,
+		Scale:     fusedScales,
+		BlockAxis: 1,
+		BlockSize: p.N,
+	}
+
 	var result *Node
 	if p.HasGelu {
-		result = nn.QuantizedDense(floatInput, b, fusedScales, bias,
-			backends.QuantInt8, p.N, p.N, activations.TypeGelu)
+		result = nn.QuantizedDense(floatInput, b, quant, bias, activations.TypeGelu)
 	} else {
-		result = nn.QuantizedDense(floatInput, b, fusedScales, bias,
-			backends.QuantInt8, p.N, p.N)
+		result = nn.QuantizedDense(floatInput, b, quant, bias)
 	}
 
 	convertedOutputs[c.outputName] = result
